@@ -34,8 +34,6 @@ use crate::{
     paged_attention::input_metadata::InputMetadata,
     try_api, SpecificConfig,
 };
-use std::path::Path;
-
 use candle_core::quantized::gguf_file;
 use candle_core::{DType, Device, Tensor};
 use candle_examples::token_output_stream::TokenOutputStream;
@@ -44,9 +42,11 @@ use either::Either::{Left, Right};
 use hf_hub::{api::sync::ApiBuilder, Repo, RepoType};
 use rayon::prelude::*;
 use std::collections::VecDeque;
+use std::path::Path;
 pub use std::rc::Rc;
 use std::{path::PathBuf, sync::Arc};
 use tokenizers::Tokenizer;
+use tracing::info;
 const EOS_TOKEN: &str = "</s>";
 const SAMPLING_SEED: u64 = 299792458;
 const MIN_GEN_TOKENS: usize = 128;
@@ -156,12 +156,16 @@ impl DefaultLoader {
         })
     }
 
+    //support loading in both multithreaded and multiprocess mode
     pub async fn load_model(
         &self,
         paths: DefaultModelPaths,
         dtype: DType,
         quant: &Option<String>,
-        device_ids: Vec<usize>,
+        device_ids: Vec<usize>, //pass only 1 device_id in multiprocess mode, otherwise, multiple device_ids in multithread mode
+        #[cfg(feature = "eccl")] comm_id: Option<crate::openai::distributed::Id>, //must pass comm id in multiprocess mode
+        local_rank: Option<usize>, //must pass current rank in multiprocess mode
+        num_devices: Option<usize>, //must pass the number of devices used in multiprocess mode
     ) -> Result<(Vec<Box<DefaultPipeline>>, PipelineConfig), APIError> {
         let specific_args = self.config.clone();
 
@@ -170,7 +174,7 @@ impl DefaultLoader {
         {
             let device = crate::new_device(device_ids[0]).unwrap();
             let path = paths.get_weight_filenames()[0].clone();
-            println!(
+            info!(
                 "Loading quantized {} model from file {}",
                 self.name,
                 path.display()
@@ -272,22 +276,40 @@ impl DefaultLoader {
                 _ => panic!("Model not supported!"),
             };
 
-            println!("Model {:?}", config);
+            info!("Model {:?}", config);
             let paths: Vec<PathBuf> = paths.get_weight_filenames();
             let shared_vb =
                 unsafe { candle_nn::var_builder::ShardedSafeTensors::var_backend(&paths).unwrap() };
 
-            println!("Loading {} model.", self.name);
+            info!("Loading {} model.", self.name);
             use crate::openai::distributed::Comm;
             #[cfg(feature = "eccl")]
-            let id = candle_core::gcu_backend::ubridge::eccl::Id::new().unwrap();
+            let id = if comm_id.is_some() {
+                comm_id.unwrap()
+            } else {
+                crate::openai::distributed::Id::new().unwrap()
+            };
+
+            assert!(
+                (comm_id.is_some() && device_ids.len() == 1)
+                    || (comm_id.is_none() && device_ids.len() >= 1)
+            );
             let results: Vec<_> = device_ids
                 .par_iter()
                 .enumerate()
                 .map(|(rank, dev_id)| {
-                    let num_devices = device_ids.len();
-                    if num_devices > 1 {
-                        println!(
+                    let rank = if local_rank.is_some() {
+                        local_rank.unwrap()
+                    } else {
+                        rank
+                    };
+                    let num_shards = if num_devices.is_some() {
+                        num_devices.unwrap()
+                    } else {
+                        device_ids.len()
+                    };
+                    if num_shards > 1 {
+                        info!(
                             "Loading partial model on device rank {} (ordinal {})",
                             rank, *dev_id
                         );
@@ -302,7 +324,7 @@ impl DefaultLoader {
                         Comm::from_rank(
                             device.as_gcu_device().unwrap().gcu_device(),
                             rank,
-                            num_devices,
+                            num_shards,
                             id,
                         )
                         .unwrap(),
@@ -442,12 +464,12 @@ impl DefaultLoader {
             (None, None, None)
         };
         if chat_template.is_some() {
-            println!("Chat Template {} \n", chat_template.as_ref().unwrap());
+            info!("Chat Template {} \n", chat_template.as_ref().unwrap());
         } else {
-            println!("Warning: Missing tokenizer_config.json \n Warning: Chat Template not found, use built-in template which may not correct!");
+            info!("Warning: Missing tokenizer_config.json \n Warning: Chat Template not found, use built-in template which may not correct!");
         }
-        println!("{:?}", pipeline_config);
-        println!("{:?}", specific_args);
+        info!("{:?}", pipeline_config);
+        info!("{:?}", specific_args);
 
         let pipelines = models
             .into_iter()

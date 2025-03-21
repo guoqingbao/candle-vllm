@@ -1,4 +1,5 @@
 use super::{DefaultPipeline, _make_tensor_with_pad};
+use crate::openai::communicator::{DaemonManager, MessageType, TaskData};
 use crate::openai::streaming::ChatResponse;
 use crate::scheduler::Scheduler;
 use crate::{
@@ -35,6 +36,7 @@ use std::{
 };
 use tokenizers::Encoding;
 use tokio::sync::Notify;
+use tracing::info;
 #[allow(dead_code)]
 struct PreparedInputs {
     tokens: Tensor,
@@ -55,12 +57,16 @@ pub struct LLMEngine {
     pub finish_notify: Arc<Notify>,
     pub completion_records: HashMap<String, (Vec<ChatChoice>, ChatCompletionUsageResponse)>,
     sequence_groups: RwLock<VecDeque<Arc<SequenceGroup>>>,
+    multi_process: bool,
+    cur_tasks: RwLock<Vec<TaskData>>,
+    daemon_manager: RwLock<Option<DaemonManager>>,
 }
 
 impl LLMEngine {
     async fn generate_parallel(
         engine: &Arc<RwLock<LLMEngine>>,
         ranks: Vec<usize>,
+        multi_process: bool,
     ) -> Vec<HashMap<String, (Vec<ChatChoice>, ChatCompletionUsageResponse)>> {
         #[cfg(feature = "eccl")]
         let iterator = ranks.par_iter();
@@ -73,6 +79,7 @@ impl LLMEngine {
                 Self::generate_once(engine_clone, *rank).unwrap()
             })
             .collect();
+
         tasks
     }
 
@@ -84,6 +91,9 @@ impl LLMEngine {
         notify: Arc<Notify>,
         finish_notify: Arc<Notify>,
         holding_time: usize,
+        num_shards: usize,
+        multi_process: bool,
+        daemon_manager: Option<DaemonManager>,
     ) -> Result<Arc<RwLock<Self>>, APIError> {
         let num_threads: usize = pipelines.len();
         let engine = Arc::new(RwLock::new(Self {
@@ -97,6 +107,9 @@ impl LLMEngine {
             finish_notify: finish_notify.clone(),
             completion_records: HashMap::new(),
             sequence_groups: RwLock::new(VecDeque::new()),
+            multi_process,
+            cur_tasks: RwLock::new(Vec::<TaskData>::new()),
+            daemon_manager: RwLock::new(daemon_manager),
         }));
         let engine_clone = engine.clone();
 
@@ -104,12 +117,72 @@ impl LLMEngine {
         for rank in 0..num_threads {
             ranks.push(rank);
         }
+        info!("start llm engine, number of pipeline {}!", num_threads);
         let _ = tokio::task::spawn_blocking(move || {
             tokio::runtime::Handle::current().block_on(async move {
+                // #[cfg(feature = "eccl")]
+                // if multi_process{
+                //     let e = engine.read().unwrap();
+                //     let (pipeline, _) = e.get_pipeline(0).unwrap();
+                //     let device = pipeline.device();
+                //     let _ = device.as_gcu_device().unwrap().bind_to_thread();
+                // }
+
                 loop {
-                    notify.notified().await; // Blocking call to wait for notification
-                    let _ = tokio::time::sleep(tokio::time::Duration::from_millis(holding_time as u64)).await;
-                    let results = Self::generate_parallel(&engine, ranks.clone()).await;
+                    if multi_process {
+                        info!("process enter!");
+                        info!("is daemon {}", DaemonManager::is_daemon());
+
+                        if DaemonManager::is_daemon() {
+                            info!("daemon process wait_task!");
+                            let message = {
+                                let mut e = engine.write().unwrap();
+                                let mut daemon_manager = e.daemon_manager.write().unwrap();
+                                daemon_manager.as_mut().unwrap().receive_message()
+                            };
+                            match message {
+                                Ok(MessageType::Start) => {
+                                    info!("A start message!");
+                                    let _ = tokio::time::sleep(tokio::time::Duration::from_millis(10u64)).await;
+                                    continue;
+                                }
+                                Ok(MessageType::Data(data)) => {
+                                    let mut e = engine.write().unwrap();
+                                    for task in data {
+                                        info!("Add request {} to task list!", task.request_id);
+                                        e.add_request(task.prompt, task.request_id, task.created, task.sampling_params, task.use_logprobs, None);
+                                    }
+                                }
+                                Ok(MessageType::Close) => {
+                                    info!("A close message!");
+                                    continue;
+                                }
+                                _=> { let _ = tokio::time::sleep(tokio::time::Duration::from_millis(10u64)).await; }
+                            };
+
+                        } else {
+                            notify.notified().await;
+                            let _ = tokio::time::sleep(tokio::time::Duration::from_millis(holding_time as u64)).await;
+                            {
+                                let e = engine.write().unwrap();
+                                let mut daemon_manager = e.daemon_manager.write().unwrap();
+                                let mut cur_tasks = e.cur_tasks.write().unwrap();
+                                let send_tasks = cur_tasks.clone();
+                                info!("Sending {} tasks to {} subprocesses", send_tasks.len(), num_shards - 1);
+                                daemon_manager.as_mut().unwrap().send_message(&MessageType::Data(send_tasks));
+                                let _ = tokio::time::sleep(tokio::time::Duration::from_millis(holding_time as u64)).await;
+                                cur_tasks.clear();
+                            }
+                        }
+                    } else {
+                        info!("thread mode wait task!");
+                        notify.notified().await; // Blocking call to wait for notification
+                        let _ = tokio::time::sleep(tokio::time::Duration::from_millis(holding_time as u64)).await;
+                    }
+                    let results = Self::generate_parallel(&engine, ranks.clone(), multi_process).await;
+                    if multi_process && DaemonManager::is_daemon() {
+                        continue;
+                    }
                     let result = &results[0];
                     if results.len() == 0 || result.len() == 0 {
                         continue;
@@ -217,15 +290,20 @@ impl LLMEngine {
         #[cfg(feature = "eccl")]
         {
             let e = engine.read().unwrap();
+            // if !e.multi_process {
             let (pipeline, _) = e.get_pipeline(rank).unwrap();
             let device = pipeline.device();
             let _ = device.as_gcu_device().unwrap().bind_to_thread();
+            info!("generate_once: bind_to_thread")
+
+            // }
         }
         loop {
             std::thread::sleep(std::time::Duration::from_millis(1));
             {
                 let e = engine.read().unwrap();
                 if !e.scheduler.has_unfinished_sequences() {
+                    info!("generate_once: no unfinished_sequences, break");
                     break;
                 }
             }
@@ -234,7 +312,8 @@ impl LLMEngine {
                 let mut e = engine.write().unwrap();
                 let scheduler_outputs = e.scheduler.schedule();
                 if !scheduler_outputs.ignored_seq_groups.is_empty() {
-                    todo!();
+                    // todo!();
+                    info!("todo: ignored_seq_groups empty")
                 }
                 e.execute_scheduler_ops(&scheduler_outputs, 0).unwrap();
                 let mut groups = e.sequence_groups.write().unwrap();
@@ -276,6 +355,7 @@ impl LLMEngine {
                     Some(&cache_engine.get_kv_cache()),
                     &metadata,
                 )?;
+                info!("generate_once: forward finish");
 
                 x
             };
@@ -284,6 +364,7 @@ impl LLMEngine {
                 //only the first rank thread perform sampling
                 let mut e = engine.write().unwrap();
                 let default_pipeline = e.get_mut_pipeline(0usize).unwrap().0.as_mut();
+                info!("generate_once: sample");
                 Some(default_pipeline.sample(&logits, &scheduled).unwrap())
             } else {
                 None
@@ -296,6 +377,11 @@ impl LLMEngine {
             }
 
             if optional_results.is_none() {
+                // if DaemonManager::is_daemon() {
+                //     let mut e = engine.write().unwrap();
+                //     e.scheduler.free_finished_sequence_groups();
+                //     info!("generate_once: daemon wait next token generation");
+                // }
                 continue;
             }
 
@@ -449,6 +535,8 @@ impl LLMEngine {
             let default_pipeline = e.get_mut_pipeline(rank).unwrap().0.as_mut();
             default_pipeline.reset_decoder();
         }
+        info!("generate_once: finished generation");
+
         Ok(responses)
     }
 }
@@ -700,7 +788,7 @@ impl LLMEngine {
             self.group_id,
             request_id.clone(),
             created,
-            sampling_params,
+            sampling_params.clone(),
             use_logprobs,
             sender,
         );
@@ -712,5 +800,19 @@ impl LLMEngine {
             request_id.clone(),
             prompt_len
         );
+
+        #[cfg(feature = "eccl")]
+        if self.multi_process && !DaemonManager::is_daemon() {
+            info!("add task to list");
+            let task = TaskData {
+                prompt,
+                request_id,
+                created,
+                sampling_params,
+                use_logprobs,
+            };
+            let mut cur_tasks = self.cur_tasks.write().unwrap();
+            cur_tasks.push(task);
+        }
     }
 }
