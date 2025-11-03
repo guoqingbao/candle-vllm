@@ -13,11 +13,11 @@ anyhow = "1.0.75"
 rand = "0.9.0"
 rayon="1.10.0"
 hyper = { version = "0.14", features = ["full"] }
-candle-core = { git = "https://github.com/EnflameTechnology/candle.git", version = "0.8.1", rev ="e58a0c3" }
-candle-examples = { git = "https://github.com/EnflameTechnology/candle.git", version = "0.8.1", rev ="e58a0c3" }
-candle-nn = { git = "https://github.com/EnflameTechnology/candle.git", version = "0.8.1", rev ="e58a0c3" }
-candle-transformers = { git = "https://github.com/EnflameTechnology/candle.git", version = "0.8.1", rev ="e58a0c3" }
-candle-flash-attn = { git = "https://github.com/EnflameTechnology/candle.git", version = "0.8.1", rev ="e58a0c3", optional = true }
+candle-core = { git = "https://github.com/EnflameTechnology/candle.git", version = "0.8.1", rev ="dc81641" }
+#candle-examples = { git = "https://github.com/EnflameTechnology/candle.git", version = "0.8.1", rev ="dc81641" }
+candle-nn = { git = "https://github.com/EnflameTechnology/candle.git", version = "0.8.1", rev ="dc81641" }
+candle-transformers = { git = "https://github.com/EnflameTechnology/candle.git", version = "0.8.1", rev ="dc81641" }
+candle-flash-attn = { git = "https://github.com/EnflameTechnology/candle.git", version = "0.8.1", rev ="dc81641", optional = true }
 dyn-fmt = "0.4.0"
 serde = { version = "1.0.190", features = ["serde_derive"] }
 tokenizers = "0.21.2"
@@ -62,13 +62,11 @@ which = "5"
 ahash = "0.8.11"
 
 [features]
-accelerate = ["dep:accelerate-src", "candle-core/accelerate", "candle-nn/accelerate", "candle-transformers/accelerate"]
 cuda = ["candle-core/cuda", "candle-nn/cuda", "candle-transformers/cuda"]
-gcu = ["candle-core/gcu", "candle-core/async", "candle-nn/gcu", "candle-transformers/gcu", "candle-examples/gcu"]
-metal = ["candle-core/metal", "candle-nn/metal", "candle-transformers/metal", "dep:metal"]
+gcu = ["candle-core/gcu", "candle-core/async", "candle-nn/gcu", "candle-transformers/gcu"]
+metal = ["candle-core/metal", "candle-nn/metal", "dep:metal"]
 cudnn = ["candle-core/cudnn"]
-flash-attn = ["cuda", "candle-transformers/flash-attn", "dep:candle-flash-attn"]
-mkl = ["dep:intel-mkl-src", "candle-core/mkl", "candle-nn/mkl", "candle-transformers/mkl"]
+mkl = ["dep:intel-mkl-src", "candle-core/mkl", "candle-nn/mkl"]
 nccl = ["candle-core/nccl"]
 eccl = ["candle-core/eccl", "candle-nn/eccl"]
 mpi = ["candle-core/eccl", "candle-nn/eccl", "dep:mpi"]
