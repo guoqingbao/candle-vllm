@@ -92,9 +92,9 @@ impl Attention {
 
         //we use higher precision for q/k norm
         let q_norm =
-            rms_norm_with_dtype(head_dim, cfg.rms_norm_eps, vb.pp("q_norm"), DType::F32).ok();
+            rms_norm_with_dtype(head_dim, cfg.rms_norm_eps, vb.pp("q_norm"), vb.dtype()).ok();
         let k_norm =
-            rms_norm_with_dtype(head_dim, cfg.rms_norm_eps, vb.pp("k_norm"), DType::F32).ok();
+            rms_norm_with_dtype(head_dim, cfg.rms_norm_eps, vb.pp("k_norm"), vb.dtype()).ok();
 
         assert!(cfg.num_attention_heads >= comm.world_size());
         assert!(cfg.num_attention_heads % comm.world_size() == 0);
@@ -147,35 +147,33 @@ impl Attention {
         let q = query_states
             .reshape((1, seq_len, self.num_heads, self.head_dim))?
             .transpose(1, 2)?;
-        // .contiguous()?;
         let k = key_states
             .reshape((1, seq_len, self.num_kv_heads, self.head_dim))?
             .transpose(1, 2)?;
-        // .contiguous()?;
         let v = value_states
             .reshape((1, seq_len, self.num_kv_heads, self.head_dim))?
             .transpose(1, 2)?
             .contiguous()?;
 
         let (q, k) = if let (Some(q_norm), Some(k_norm)) = (&self.q_norm, &self.k_norm) {
-            let (q, k) = if q.dtype() != DType::F32 {
-                (q.to_dtype(DType::F32)?, k.to_dtype(DType::F32)?)
-            } else {
-                (q, k)
-            };
-
             // Per‑head RMSNorm in qwen3
-            let q_flat = q.flatten(0, 2)?; // (B*H, L, D) -> (BHL, D) after transpose later
-            let k_flat = k.flatten(0, 2)?;
+            let q_flat = q.contiguous()?.flatten(0, 2)?; // (B*H, L, D) -> (BHL, D) after transpose later
+            let k_flat = k.contiguous()?.flatten(0, 2)?;
 
-            // q_norm and k_norm weights stored in f32 format in qwen3 gguf
             let q_flat = q_norm.forward(&q_flat)?;
             let k_flat = k_norm.forward(&k_flat)?;
 
-            let q = q_flat.reshape((1, self.num_heads, seq_len, self.head_dim))?;
-            let k = k_flat.reshape((1, self.num_kv_heads, seq_len, self.head_dim))?;
+            // This is necessary on GCU since we need transposed layout
+            let q = q_flat
+                .reshape((1, self.num_heads, seq_len, self.head_dim))?
+                .transpose(1, 2)?
+                .contiguous()?;
+            let k = k_flat
+                .reshape((1, self.num_kv_heads, seq_len, self.head_dim))?
+                .transpose(1, 2)?
+                .contiguous()?;
 
-            (q, k)
+            (q.transpose(1, 2)?, k.transpose(1, 2)?)
         } else {
             (q, k)
         };
