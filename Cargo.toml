@@ -70,5 +70,7 @@ mkl = ["dep:intel-mkl-src", "candle-core/mkl", "candle-nn/mkl"]
 nccl = ["candle-core/nccl"]
 eccl = ["candle-core/eccl", "candle-nn/eccl"]
 mpi = ["candle-core/eccl", "candle-nn/eccl", "dep:mpi"]
+# TODO: graph, flash-attn, context-cache
 graph = []
 flash-decoding = []
+flash-attn = []
