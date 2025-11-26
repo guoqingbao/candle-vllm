@@ -47,7 +47,7 @@ macro_rules! graph_model_wrapper {
                         model_arc.forward(input_ids, positions, kv_caches, input_metadata)
                     };
                     let boxed_closure: Box<ModelFn> = Box::new(closure);
-                    CudaGraphWrapper::new(boxed_closure, $device.as_cuda_device()?.clone().into())
+                    CudaGraphWrapper::new(boxed_closure, $device.as_gcu_device()?.clone().into())
                 },
             )+
         }

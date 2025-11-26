@@ -95,8 +95,8 @@ impl LLMEngine {
     pub fn graph_capture(engine: &Arc<RwLock<LLMEngine>>) -> Result<()> {
         let mut e = engine.write();
         let (ref mut pipeline, cache_engine) = e.get_mut_pipeline(0usize).unwrap();
-        let device = pipeline.device();
-        let _ = device.as_cuda_device().unwrap().bind_to_thread();
+        // let device = pipeline.device();
+        // let _ = device.as_cuda_device().unwrap().bind_to_thread();
         let x = pipeline.warmup_capture(Some(&cache_engine.get_kv_cache()));
         x
     }

@@ -1,61 +1,63 @@
 // Original implementation:
 // https://github.com/guoqingbao/vllm.rs/blob/main/src/utils/graph.rs
-use std::collections::BTreeMap;
-use std::ptr;
-use std::sync::Arc;
-
-use attention_rs::InputMetadata;
-use candle_core::cuda_backend::cudarc::driver::sys;
-use candle_core::cuda_backend::cudarc::driver::sys::{
-    lib, CUgraphInstantiate_flags, CUmemPool_attribute, CUmemoryPool, CUstreamCaptureMode,
-    CUstreamCaptureStatus,
-};
-use candle_core::cuda_backend::CudaDevice;
+use crate::InputMetadata;
+use candle_core::gcu_backend::ubridge::gcu_device::driv;
+use candle_core::gcu_backend::ubridge::prelude::tops::error::ToResult;
+use candle_core::gcu_backend::GcuDevice;
 use candle_core::{DType, Device, Result, Tensor};
 use parking_lot::RwLock;
+use std::collections::BTreeMap;
 use std::mem::MaybeUninit;
+use std::ptr;
+use std::sync::Arc;
 use tqdm::tqdm;
 
 #[allow(dead_code)]
 pub struct CudaGraph {
-    cu_graph: sys::CUgraph,
-    cu_graph_exec: sys::CUgraphExec,
-    stream: sys::CUstream,
+    cu_graph: driv::topsGraph_t,
+    cu_graph_exec: driv::topsGraphExec_t,
+    stream: driv::topsStream_t,
 }
 
 impl CudaGraph {
-    pub fn begin_capture(stream: sys::CUstream, mode: sys::CUstreamCaptureMode) -> Result<()> {
+    pub fn begin_capture(
+        stream: driv::topsStream_t,
+        mode: driv::topsStreamCaptureMode,
+    ) -> Result<()> {
         unsafe {
-            lib()
-                .cuStreamBeginCapture_v2(stream, mode)
-                .result()
-                .map_err(|e| candle_core::Error::Msg(format!("begin_capture failed: {e:?}")))
+            driv::topsStreamBeginCapture(stream, mode)
+                .to_result()
+                .map_err(|e| {
+                    candle_core::Error::Msg(format!("topsStreamBeginCapture failed: {e:?}"))
+                })
         }
     }
 
     pub fn end_capture(
-        stream: sys::CUstream,
-        flags: sys::CUgraphInstantiate_flags,
+        stream: driv::topsStream_t,
+        flags: driv::topsGraphInstantiateFlags,
     ) -> Result<CudaGraph> {
         let mut graph = MaybeUninit::uninit();
         let cu_graph = unsafe {
-            lib()
-                .cuStreamEndCapture(stream, graph.as_mut_ptr())
-                .result()
+            driv::topsStreamEndCapture(stream, graph.as_mut_ptr())
+                .to_result()
                 .map_err(|e| {
-                    candle_core::Error::Msg(format!("cuStreamEndCapture failed: {e:?}"))
+                    candle_core::Error::Msg(format!("topsStreamEndCapture failed: {e:?}"))
                 })?;
             graph.assume_init()
         };
 
         let mut graph_exec = MaybeUninit::uninit();
         let cu_graph_exec = unsafe {
-            lib()
-                .cuGraphInstantiateWithFlags(graph_exec.as_mut_ptr(), cu_graph, flags as u32 as u64)
-                .result()
-                .map_err(|e| {
-                    candle_core::Error::Msg(format!("cuGraphInstantiateWithFlags failed: {e:?}"))
-                })?;
+            driv::topsGraphInstantiateWithFlags(
+                graph_exec.as_mut_ptr(),
+                cu_graph,
+                flags as u32 as u64,
+            )
+            .to_result()
+            .map_err(|e| {
+                candle_core::Error::Msg(format!("topsGraphInstantiateWithFlags failed: {e:?}"))
+            })?;
             graph_exec.assume_init()
         };
         Ok(CudaGraph {
@@ -65,14 +67,13 @@ impl CudaGraph {
         })
     }
 
-    pub fn capture_status(stream: sys::CUstream) -> Result<sys::CUstreamCaptureStatus> {
-        let mut status = CUstreamCaptureStatus::CU_STREAM_CAPTURE_STATUS_NONE;
+    pub fn capture_status(stream: driv::topsStream_t) -> Result<driv::topsStreamCaptureStatus> {
+        let mut status = driv::topsStreamCaptureStatus::topsStreamCaptureStatusNone;
         unsafe {
-            lib()
-                .cuStreamIsCapturing(stream, &mut status)
-                .result()
+            driv::topsStreamIsCapturing(stream, &mut status)
+                .to_result()
                 .map_err(|e| {
-                    candle_core::Error::Msg(format!("cuGraphInstantiateWithFlags failed: {e:?}"))
+                    candle_core::Error::Msg(format!("topsStreamIsCapturing failed: {e:?}"))
                 })?;
         }
         Ok(status)
@@ -80,10 +81,9 @@ impl CudaGraph {
 
     pub fn launch(&self) -> Result<()> {
         unsafe {
-            lib()
-                .cuGraphLaunch(self.cu_graph_exec, self.stream)
-                .result()
-                .map_err(|e| candle_core::Error::Msg(format!("cuGraphLaunch failed: {e:?}")))
+            driv::topsGraphLaunch(self.cu_graph_exec, self.stream)
+                .to_result()
+                .map_err(|e| candle_core::Error::Msg(format!("topsGraphLaunch failed: {e:?}")))
         }
     }
 }
@@ -132,7 +132,7 @@ where
     captured_graphs: BTreeMap<usize, CudaGraphHandle>,
     capturing: bool,
     current_bs: Option<usize>,
-    device: Arc<CudaDevice>,
+    device: Arc<GcuDevice>,
     pub pool_handle: RwLock<Option<i64>>,
     captured_bs: Vec<usize>,
 }
@@ -146,7 +146,7 @@ where
         &'a InputMetadata,
     ) -> Result<Tensor>,
 {
-    pub fn new(module: M, device: Arc<CudaDevice>) -> Self {
+    pub fn new(module: M, device: Arc<GcuDevice>) -> Self {
         Self {
             module,
             captured_graphs: BTreeMap::new(),
@@ -159,38 +159,41 @@ where
     }
 
     fn sync_stream(&self) -> Result<()> {
+        let stream = self
+            .device
+            .stream_inner()
+            .expect("unable to obtain stream!");
         unsafe {
-            lib()
-                .cuStreamSynchronize(self.device.cu_stream().clone())
-                .result()
-                .map_err(|e| candle_core::Error::Msg(format!("cuStreamSynchronize failed: {e:?}")))
+            driv::topsStreamSynchronize(stream)
+                .to_result()
+                .map_err(|e| {
+                    candle_core::Error::Msg(format!("topsStreamSynchronize failed: {e:?}"))
+                })
         }
     }
 
-    fn create_capture_pool(&self) -> Result<CUmemoryPool> {
-        let mut pool: CUmemoryPool = ptr::null_mut();
+    fn create_capture_pool(&self) -> Result<driv::topsMemPool_t> {
+        let mut pool: driv::topsMemPool_t = ptr::null_mut();
         unsafe {
-            lib()
-                .cuDeviceGetDefaultMemPool(&mut pool, *self.device.cu_device())
-                .result()
+            driv::topsDeviceGetDefaultMemPool(&mut pool, self.device.gcu_device().id as i32)
+                .to_result()
                 .map_err(|e| {
-                    candle_core::Error::Msg(format!("cuDeviceGetDefaultMemPool failed: {e:?}"))
+                    candle_core::Error::Msg(format!("topsDeviceGetDefaultMemPool failed: {e:?}"))
                 })?;
 
             let handle = pool as *mut std::ffi::c_void as usize as i64;
             *self.pool_handle.write() = Some(handle);
 
             let threshold: u64 = u64::MAX;
-            lib()
-                .cuMemPoolSetAttribute(
-                    pool,
-                    CUmemPool_attribute::CU_MEMPOOL_ATTR_RELEASE_THRESHOLD,
-                    &threshold as *const _ as _,
-                )
-                .result()
-                .map_err(|e| {
-                    candle_core::Error::Msg(format!("cuMemPoolSetAttribute failed: {e:?}"))
-                })?;
+            driv::topsMemPoolSetAttribute(
+                pool,
+                driv::topsMemPoolAttr::topsMemPoolAttrReleaseThreshold,
+                &threshold as *const _ as _,
+            )
+            .to_result()
+            .map_err(|e| {
+                candle_core::Error::Msg(format!("topsMemPoolSetAttribute failed: {e:?}"))
+            })?;
         }
         Ok(pool)
     }
@@ -199,16 +202,18 @@ where
         if self.pool_handle.read().is_some() {
             return Ok(());
         }
-
+        let stream = self
+            .device
+            .stream_inner()
+            .expect("unable to obtain stream!");
         unsafe {
-            let status = CudaGraph::capture_status(self.device.cu_stream().clone())?;
-            if status != CUstreamCaptureStatus::CU_STREAM_CAPTURE_STATUS_ACTIVE {
+            let status = CudaGraph::capture_status(stream)?;
+            if status != driv::topsStreamCaptureStatus::topsStreamCaptureStatusActive {
                 let pool = self.create_capture_pool()?;
-                lib()
-                    .cuDeviceSetMemPool(*self.device.cu_device(), pool)
-                    .result()
+                driv::topsDeviceSetMemPool(self.device.gcu_device().id as i32, pool)
+                    .to_result()
                     .map_err(|e| {
-                        candle_core::Error::Msg(format!("cuDeviceSetMemPool failed: {e:?}"))
+                        candle_core::Error::Msg(format!("topsDeviceSetMemPool failed: {e:?}"))
                     })?;
             }
         }
@@ -216,35 +221,41 @@ where
         Ok(())
     }
 
-    /// Reads a usize attribute from the given CUDA memory pool.
-    fn get_mem_pool_attribute(pool: CUmemoryPool, attr: CUmemPool_attribute) -> Result<usize> {
+    /// Reads a usize attribute from the given GCU memory pool.
+    fn get_mem_pool_attribute(
+        pool: driv::topsMemPool_t,
+        attr: driv::topsMemPoolAttr,
+    ) -> Result<usize> {
         let mut value: usize = 0;
         unsafe {
-            sys::lib()
-                .cuMemPoolGetAttribute(pool, attr, &mut value as *mut _ as *mut std::ffi::c_void)
-                .result()
-                .map_err(|e| {
-                    candle_core::Error::Msg(format!("cuMemPoolGetAttribute failed: {e:?}"))
-                })?;
+            driv::topsMemPoolGetAttribute(
+                pool,
+                attr,
+                &mut value as *mut _ as *mut std::ffi::c_void,
+            )
+            .to_result()
+            .map_err(|e| {
+                candle_core::Error::Msg(format!("topsMemPoolGetAttribute failed: {e:?}"))
+            })?;
         }
         Ok(value)
     }
 
     /// Returns peak memory used (in bytes) from a given CUDA memory pool.
-    pub fn get_peak_memory_usage(pool: CUmemoryPool) -> Result<usize> {
-        Self::get_mem_pool_attribute(pool, CUmemPool_attribute::CU_MEMPOOL_ATTR_USED_MEM_HIGH)
+    pub fn get_peak_memory_usage(pool: driv::topsMemPool_t) -> Result<usize> {
+        Self::get_mem_pool_attribute(pool, driv::topsMemPoolAttr::topsMemPoolAttrReservedMemHigh)
     }
 
     /// Returns current memory usage (in bytes) from a given CUDA memory pool.
-    pub fn get_current_memory_usage(pool: CUmemoryPool) -> Result<usize> {
-        Self::get_mem_pool_attribute(pool, CUmemPool_attribute::CU_MEMPOOL_ATTR_USED_MEM_CURRENT)
+    pub fn get_current_memory_usage(pool: driv::topsMemPool_t) -> Result<usize> {
+        Self::get_mem_pool_attribute(pool, driv::topsMemPoolAttr::topsMemPoolAttrUsedMemCurrent)
     }
 
-    /// Retrieves the default CUDA memory pool for a device.
-    pub fn get_current_mem_pool(&self) -> Result<CUmemoryPool> {
+    /// Retrieves the default GCU memory pool for a device.
+    pub fn get_current_mem_pool(&self) -> Result<driv::topsMemPool_t> {
         if self.pool_handle.read().is_some() {
             let pool_handle = self.pool_handle.read().unwrap();
-            let pool: CUmemoryPool = pool_handle as usize as *mut sys::CUmemPoolHandle_st;
+            let pool: driv::topsMemPool_t = pool_handle as usize as driv::topsMemPool_t;
             Ok(pool)
         } else {
             candle_core::bail!("Memory pool for graph is not init!")
@@ -266,9 +277,13 @@ where
         self.current_bs = Some(bs);
         self.sync_stream()?;
         self.set_capture_mem_pool()?;
+        let stream = self
+            .device
+            .stream_inner()
+            .expect("unable to obtain stream!");
         CudaGraph::begin_capture(
-            self.device.cu_stream().clone(),
-            CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_RELAXED,
+            stream,
+            driv::topsStreamCaptureMode::topsStreamCaptureModeRelaxed,
         )?;
         Ok(())
     }
@@ -276,10 +291,13 @@ where
     fn end_capture(&mut self) -> Result<()> {
         self.capturing = false;
         let bs = self.current_bs.take().unwrap();
-
+        let stream = self
+            .device
+            .stream_inner()
+            .expect("unable to obtain stream!");
         let graph = CudaGraph::end_capture(
-            self.device.cu_stream().clone(),
-            CUgraphInstantiate_flags::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH,
+            stream,
+            driv::topsGraphInstantiateFlags::topsGraphInstantiateFlagAutoFreeOnLaunch,
         )?;
         self.captured_graphs
             .insert(bs, CudaGraphHandle::new(Arc::new(graph)));

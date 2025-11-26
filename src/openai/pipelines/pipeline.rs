@@ -969,9 +969,9 @@ impl DefaultLoader {
                         &devices[rank],
                         stop_token_ids,
                         rank,
-                        #[cfg(all(feature = "cuda", feature = "graph"))]
+                        #[cfg(all(feature = "gcu", feature = "graph"))]
                         block_size,
-                        #[cfg(all(feature = "cuda", feature = "graph"))]
+                        #[cfg(all(feature = "gcu", feature = "graph"))]
                         max_num_seqs,
                     ).unwrap()
                 )
