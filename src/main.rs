@@ -18,9 +18,10 @@ use std::sync::Arc;
 use tracing::{info, warn};
 const SIZE_IN_MB: usize = 1024 * 1024;
 use candle_vllm::openai::models::Config;
+use rustchatui::start_ui_server;
 use serde_json::json;
 use tokio::sync::Notify;
-use tower_http::cors::{AllowOrigin, CorsLayer};
+use tower_http::cors::{Any, CorsLayer};
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
@@ -33,7 +34,11 @@ struct Args {
     #[arg(long)]
     hf_token_path: Option<String>,
 
-    /// Port to serve on (localhost:port)
+    /// Host address to bind to, to serve on host:port
+    #[arg(long = "h", default_value = "0.0.0.0")]
+    host: String,
+
+    /// Port to serve on (host:port)
     #[arg(long = "p", default_value_t = 2000)]
     port: u16,
 
@@ -121,6 +126,9 @@ struct Args {
 
     #[arg(long, default_value_t = false)]
     fp8_kvcache: bool,
+
+    #[arg(long, default_value_t = false)]
+    ui_server: bool, //start candle-vllm with built-in web server
 }
 
 fn get_cache_config(
@@ -152,6 +160,7 @@ fn get_cache_config(
         num_cpu_blocks: Some(num_cpu_blocks),
         fully_init: true,
         dtype: kv_dtype,
+        kvcache_mem_gpu,
     }
 }
 
@@ -258,6 +267,13 @@ async fn main() -> Result<()> {
     let dtype = get_dtype(args.dtype);
     let kv_cache_dtype = if args.fp8_kvcache { DType::U8 } else { dtype };
 
+    if cfg!(feature = "flash-decoding") {
+        assert!(
+            !args.fp8_kvcache,
+            "fp8 kvcache is not compatible with `flash-decoding` feature!"
+        );
+    }
+
     let device_ids: Vec<usize> = match args.device_ids {
         Some(ids) => ids,
         _ => vec![0usize],
@@ -307,6 +323,7 @@ async fn main() -> Result<()> {
     }
 
     let logger: ftail::Ftail = ftail::Ftail::new();
+    let host = args.host;
     let mut port = args.port;
     #[cfg(feature = "eccl")]
     let (pipelines, global_rank, daemon_manager) = if multi_process {
@@ -523,17 +540,17 @@ async fn main() -> Result<()> {
                 std::cmp::min(kvcached_tokens / batch, max_model_len)
             );
         }
-        warn!("Server started at http://0.0.0.0:{}/v1/", port);
+        warn!("Server started at http://{host}:{port}/v1/");
     }
 
-    let allow_origin = AllowOrigin::any();
     let cors_layer = CorsLayer::new()
         .allow_methods([Method::GET, Method::POST])
         .allow_headers([http::header::CONTENT_TYPE])
-        .allow_origin(allow_origin);
+        .allow_origin(Any) // same as "*"
+        .allow_methods(Any)
+        .allow_headers(Any);
 
     let app = Router::new()
-        .layer(cors_layer)
         .route(
             "/v1/models",
             get(|| async {
@@ -555,12 +572,30 @@ async fn main() -> Result<()> {
             }),
         )
         .route("/v1/chat/completions", post(chat_completions))
+        .layer(cors_layer)
         .with_state(Arc::new(server_data));
 
-    let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{port}"))
+    let listener = tokio::net::TcpListener::bind(format!("{host}:{port}"))
         .await
         .map_err(candle_core::Error::wrap)?;
-    axum::serve(listener, app)
+
+    let mut tasks = Vec::new();
+    tasks.push(tokio::spawn(async move {
+        if let Err(e) = axum::serve(listener, app).await {
+            eprintln!("Chat API server error: {e:?}");
+        }
+    }));
+
+    // Usage example: https://github.com/guoqingbao/rustchatui/blob/main/ReadMe.md
+    if args.ui_server && global_rank == 0 {
+        tasks.push(tokio::spawn(async move {
+            start_ui_server((args.port - 1) as u16, Some(args.port as u16), None, None)
+                .await
+                .unwrap();
+        }));
+    }
+
+    futures::future::try_join_all(tasks)
         .await
         .map_err(candle_core::Error::wrap)?;
 

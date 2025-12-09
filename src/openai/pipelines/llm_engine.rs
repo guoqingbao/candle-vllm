@@ -519,7 +519,12 @@ impl LLMEngine {
 
             if is_prompt {
                 let mut e = engine.write();
-                let prefill_chunk_size = e.prefill_chunk_size.unwrap_or(PREFILL_CHUNK_SIZE);
+                let prefill_chunk_size = if cfg!(feature = "flash-decoding") {
+                    e.prefill_chunk_size.unwrap_or(PREFILL_CHUNK_SIZE / 2)
+                } else {
+                    e.prefill_chunk_size.unwrap_or(PREFILL_CHUNK_SIZE)
+                };
+
                 if prefill_chunk_size > 0 {
                     let (finished_indices, finished_groups) = e
                         .scheduler
@@ -631,7 +636,29 @@ impl LLMEngine {
                         if seq.deref().is_prompt() {
                             let e = engine.read();
                             e.scheduler.print_free_blocks();
-                            prompt_finish_times.insert(*group.get_id(), SystemTime::now());
+                            let prompt_finish_time = SystemTime::now();
+                            prompt_finish_times.insert(*group.get_id(), prompt_finish_time);
+
+                            #[cfg(feature = "nccl")]
+                            let do_log = DaemonManager::is_master_rank();
+                            #[cfg(not(feature = "nccl"))]
+                            let do_log = true;
+                            if do_log {
+                                let prompt_time_costs = prompt_finish_time
+                                    .duration_since(group.created_time)
+                                    .unwrap()
+                                    .as_millis();
+                                if prompt_time_costs > 0 {
+                                    warn!(
+                                        "Prefilling {} tokens finished in {} seconds ({} tokens/s) ({})",
+                                        seq.deref().get_prompt_len(),
+                                        prompt_time_costs / 1000,
+                                        seq.deref().get_prompt_len() * 1000
+                                            / prompt_time_costs as usize,
+                                        group.request_id,
+                                    );
+                                }
+                            }
                         }
                         if let Some(sender) = &group.sender {
                             let e = engine.read();
@@ -866,13 +893,68 @@ impl LLMEngine {
         Ok(())
     }
 
+    fn prepare_block_tables(
+        &self,
+        groups: &VecDeque<Arc<SequenceGroup>>,
+        device: &Device,
+    ) -> Result<Tensor> {
+        let mut max_len = 0;
+        for group in groups {
+            for seq in group.get_seqs().values() {
+                let len = self
+                    .scheduler
+                    .block_engine
+                    .block_tables
+                    .get(&seq.deref().get_id())
+                    .unwrap()
+                    .len();
+                if len > max_len {
+                    max_len = len;
+                }
+            }
+        }
+        let mut flat: Vec<u32> = Vec::with_capacity(groups.len() * max_len);
+
+        for group in groups {
+            for seq in group.get_seqs().values() {
+                let table = self
+                    .scheduler
+                    .block_engine
+                    .block_tables
+                    .get(&seq.deref().get_id())
+                    .unwrap();
+                let table = table
+                    .iter()
+                    .map(|block| block.deref_mut().block_id as u32)
+                    .collect::<Vec<_>>();
+
+                let bt = if let Some(sliding_window) = self.config.sliding_window {
+                    let sliding_window_blocks = sliding_window / self.cache_config.block_size;
+                    let slide_idx = if table.len() > sliding_window_blocks {
+                        table.len() - sliding_window_blocks
+                    } else {
+                        0
+                    };
+                    table.get(slide_idx..).unwrap().to_vec()
+                } else {
+                    table
+                };
+
+                flat.extend_from_slice(bt.as_slice());
+                flat.extend(std::iter::repeat(0).take(max_len - bt.len()));
+            }
+        }
+
+        Tensor::from_vec(flat, (groups.len(), max_len), device)
+    }
+
     //Revised based on https://github.com/guoqingbao/vllm.rs/blob/main/src/core/runner.rs#L392
     fn prepare_prompt(
         &self,
         groups: &VecDeque<Arc<SequenceGroup>>,
         device: &Device,
     ) -> Result<PreparedInputs> {
-        let mut prompt_lens = Vec::new();
+        let mut context_lens = Vec::new();
         let mut input_ids: Vec<u32> = Vec::new();
         let mut positions = Vec::new();
         let mut cu_seqlens_q = vec![0];
@@ -880,7 +962,11 @@ impl LLMEngine {
         let mut max_seqlen_q = 0;
         let mut max_seqlen_k = 0;
         let mut slot_mapping = Vec::new();
-        let chunk_size = self.prefill_chunk_size.unwrap_or(PREFILL_CHUNK_SIZE);
+        let chunk_size = if cfg!(feature = "flash-decoding") {
+            self.prefill_chunk_size.unwrap_or(PREFILL_CHUNK_SIZE / 2)
+        } else {
+            self.prefill_chunk_size.unwrap_or(PREFILL_CHUNK_SIZE)
+        };
         let mut max_context_len = 0;
         for group in groups {
             for seq in group.get_seqs().values() {
@@ -896,10 +982,15 @@ impl LLMEngine {
                     seq_len - num_cached_tokens
                 };
 
-                prompt_lens.push(num_tokens);
+                context_lens.push(seq_len as u32);
 
-                let seqlen_q = num_tokens; //seqlen - seq.num_cached_tokens;
-                let seqlen_k = num_tokens;
+                let seqlen_q = num_tokens;
+                let seqlen_k = if num_cached_tokens > 0 && cfg!(feature = "flash-decoding") {
+                    num_cached_tokens + num_tokens
+                } else {
+                    num_tokens
+                };
+
                 cu_seqlens_q.push(cu_seqlens_q.last().unwrap() + seqlen_q as u32);
                 cu_seqlens_k.push(cu_seqlens_k.last().unwrap() + seqlen_k as u32);
                 max_seqlen_q = std::cmp::max(max_seqlen_q, seqlen_q);
@@ -988,23 +1079,22 @@ impl LLMEngine {
 
         let slot_mapping = Tensor::from_vec(slot_mapping, (s_len,), device)?;
 
-        // Handle context cache
-        // let (context_lens, block_tables) = if cu_seqlens_k.last() > cu_seqlens_q.last() {
-        //     let ctx_len = context_lens.len();
-        //     let context_lens_t = Tensor::from_vec(context_lens, ctx_len, device)?;
-        //     let block_tables_t = self.prepare_block_tables(groups, device)?;
-        //     (Some(context_lens_t), Some(block_tables_t))
-        // } else {
-        //     (None, None)
-        // };
+        let (context_lens, block_tables) = if cu_seqlens_k.last() > cu_seqlens_q.last() {
+            let len = context_lens.len();
+            let context_lens_t = Tensor::from_vec(context_lens, len, device)?;
+            let block_tables_t = self.prepare_block_tables(groups, device)?;
+            (Some(context_lens_t), Some(block_tables_t))
+        } else {
+            (None, None)
+        };
         let cu_seqlens_q = Tensor::from_vec(cu_seqlens_q, (q_len,), device)?;
         let cu_seqlens_k = Tensor::from_vec(cu_seqlens_k, (k_len,), device)?;
 
         let input_metadata = InputMetadata {
             is_prefill: true,
             slot_mapping,
-            block_tables: None,
-            context_lens: None,
+            block_tables,
+            context_lens,
             cu_seqlens_q: Some(cu_seqlens_q),
             cu_seqlens_k: Some(cu_seqlens_k),
             max_seqlen_q,

@@ -82,32 +82,28 @@ impl PagedAttention {
         input_metadata: &InputMetadata,
         softcapping: Option<f64>,
     ) -> Result<Tensor> {
-        let (_, attention_heads, _, head_size) = query.shape().dims4()?;
+        let dims = input_metadata.slot_mapping.dims();
+        let slot_mapping = if dims.len() > 1 {
+            input_metadata.slot_mapping.flatten_all()?
+        } else {
+            input_metadata.slot_mapping.clone()
+        };
+
+        let (batch_size, attention_heads, seq_len, head_size) = query.shape().dims4()?;
         let (_, key_value_heads, _, _) = key.shape().dims4()?;
 
         #[cfg(feature = "flash-attn")]
-        let att = {
-            let q = query
-                .transpose(1, 2)?
-                .reshape(((), attention_heads, head_size))?;
-            let key = if input_metadata.block_tables.is_none() {
-                let key = key
-                    .transpose(1, 2)?
-                    .reshape(((), key_value_heads, head_size))?;
-                key
-            } else {
-                key.to_owned()
-            };
+        let att = if input_metadata.is_prompt {
+            let k = self
+                .repeat_kv(key.clone(), attention_heads / key_value_heads)?
+                .contiguous()?;
+            let v = self
+                .repeat_kv(value.clone(), attention_heads / key_value_heads)?
+                .contiguous()?;
 
-            let value = if input_metadata.block_tables.is_none() {
-                let value = value
-                    .transpose(1, 2)?
-                    .reshape(((), key_value_heads, head_size))?;
-                value
-            } else {
-                value.to_owned()
-            };
-
+            let q = query.transpose(1, 2)?;
+            let k = k.transpose(1, 2)?;
+            let v = v.transpose(1, 2)?;
             let attn = if self.sliding_window.is_some() {
                 candle_flash_attn::flash_attn_varlen_windowed_softcap(
                     &q,

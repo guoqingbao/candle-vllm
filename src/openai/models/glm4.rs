@@ -4,7 +4,7 @@ use crate::openai::distributed::{
     embedding, rms_norm, Comm, MergedParallelColumnLinear, ReplicatedLinear,
     TensorParallelRowLinear, VarBuilder,
 };
-use crate::openai::models::mask::get_attention_casual_mask;
+use crate::openai::models::mask::get_attention_causal_mask;
 use crate::InputMetadata;
 use candle::{DType, Device, Result, Tensor};
 use candle_core as candle;
@@ -28,7 +28,6 @@ impl GLM4 {
                 .num_key_value_heads
                 .unwrap_or(config.num_attention_heads),
         );
-        config.num_hidden_layers = config.num_hidden_layers;
         config.max_seq_len = config.max_position_embeddings.unwrap_or(32768);
         config.attention_bias = Some(config.attention_bias.unwrap_or(false));
         config.bos_token_id = Some(
@@ -245,7 +244,7 @@ impl GLM4 {
         } else {
             Vec::new()
         };
-        let attention_mask = get_attention_casual_mask(
+        let attention_mask = get_attention_causal_mask(
             &self.device,
             self.dtype,
             input_positions,

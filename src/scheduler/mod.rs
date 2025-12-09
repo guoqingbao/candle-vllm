@@ -45,6 +45,7 @@ pub struct Scheduler {
     swapped_out: VecDeque<Arc<SequenceGroup>>,
     config: SchedulerConfig,
     pub block_engine: BlockEngine,
+    is_last_prefill: bool,
 }
 
 impl Scheduler {
@@ -59,7 +60,9 @@ impl Scheduler {
                 cache_config.block_size,
                 cache_config.num_gpu_blocks.unwrap(),
                 cache_config.num_cpu_blocks.unwrap(),
+                cache_config.kvcache_mem_gpu,
             ),
+            is_last_prefill: false,
         }
     }
 
@@ -74,6 +77,9 @@ impl Scheduler {
             let mut scheduled = VecDeque::new();
             let mut ignored_seq_groups = VecDeque::new();
             while !self.waiting.is_empty() {
+                if self.is_last_prefill && self.running.len() > 0 {
+                    break; // interleaved scheduling
+                }
                 let seq_group = self.waiting.front().unwrap().clone();
 
                 // If adding this seq means we will have too many, stop as no more could be added.
@@ -116,6 +122,7 @@ impl Scheduler {
 
             // If we did schedule, or we ignored sequences.
             if !scheduled.is_empty() || !ignored_seq_groups.is_empty() {
+                self.is_last_prefill = true;
                 return SchedulerOutput {
                     scheduled: Arc::new(scheduled),
                     blocks_to_swap_in: HashMap::new(),
@@ -193,6 +200,7 @@ impl Scheduler {
             }
         }
 
+        self.is_last_prefill = false;
         SchedulerOutput {
             scheduled: self.running.clone().into(),
             blocks_to_swap_in,
@@ -228,10 +236,15 @@ impl Scheduler {
 
     pub fn print_free_blocks(&self) {
         let free_blocks = self.block_engine.get_num_free_blocks();
+        let num_blocks = self.block_engine.get_num_blocks();
+        let kvcache_mem_size = self.block_engine.get_kvcache_mem_size() as f32 / 1024f32;
+        let used_percent = (num_blocks - free_blocks) as f32 * 100f32 / num_blocks as f32;
         tracing::info!(
-            "Available kvcache blocks {} (for {} tokens)",
-            free_blocks,
-            free_blocks * self.block_engine.get_block_size()
+            "Available {} KvCache tokens ({:.02}/{:.02}GB, used {:.02}%)",
+            free_blocks * self.block_engine.get_block_size(),
+            used_percent / 100f32 * kvcache_mem_size,
+            kvcache_mem_size,
+            used_percent,
         );
     }
 

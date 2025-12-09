@@ -3,7 +3,7 @@ use super::{
 };
 use crate::backend::progress::{ProgressLike, ProgressReporter};
 use crate::openai::distributed::{embedding, Comm, ReplicatedLinear, VarBuilder};
-use crate::openai::models::mask::get_attention_casual_mask;
+use crate::openai::models::mask::get_attention_causal_mask;
 use crate::openai::models::rotary_emb::DefaultRotaryEmbedding;
 use crate::openai::models::ScalingValue;
 use crate::openai::models::TokenID;
@@ -404,7 +404,7 @@ impl Gemma3 {
         is_prefill: bool,
     ) -> Result<(Option<Vec<Tensor>>, Option<Vec<Tensor>>)> {
         //normal mask
-        let mask = get_attention_casual_mask(
+        let mask = get_attention_causal_mask(
             &self.device,
             self.dtype,
             input_positions,
@@ -414,7 +414,7 @@ impl Gemma3 {
         );
 
         //sliding_mask
-        let sliding_mask = get_attention_casual_mask(
+        let sliding_mask = get_attention_causal_mask(
             &self.device,
             self.dtype,
             input_positions,
