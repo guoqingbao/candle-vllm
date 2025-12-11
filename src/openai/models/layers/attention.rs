@@ -4,7 +4,7 @@ use crate::openai::distributed::{
 };
 use crate::openai::models::layers::qrmsnorm::QRmsNorm;
 use crate::openai::models::Config;
-use crate::{InputMetadata, PagedAttention};
+use attention_rs::{InputMetadata, PagedAttention};
 use candle_core::quantized::{gguf_file, QMatMul};
 use candle_core::{DType, Device, Module, Result, Tensor};
 use candle_nn::RmsNorm;

@@ -5,6 +5,7 @@ use crate::openai::distributed::AllReduce;
 use crate::openai::distributed::{Comm, VarBuilder};
 use crate::openai::models::linear::Linear;
 use crate::openai::models::{Config, MoEConfig};
+use attention_rs::moe;
 use candle::{DType, Module, Result, Tensor, D};
 use candle_core as candle;
 use candle_nn::var_builder::Shard;
@@ -102,11 +103,10 @@ impl FusedMoe {
 
         let ys = {
             let xs = xs.reshape((num_tokens, 1, hidden_dim))?;
-            let gate = candle_nn::ops::indexed_moe(&xs, &self.gate_experts, &indices)?;
-            let up = candle_nn::ops::indexed_moe(&xs, &self.up_experts, &indices)?;
+            let gate = moe::moe_gemm(&xs, &self.gate_experts, &indices)?;
+            let up = moe::moe_gemm(&xs, &self.up_experts, &indices)?;
             let down_inputs = (up * gate.apply(&self.act)?)?;
-            candle_nn::ops::indexed_moe(&down_inputs, &self.down_experts, &indices)?
-                .to_dtype(DType::F32)?
+            moe::moe_gemm(&down_inputs, &self.down_experts, &indices)?.to_dtype(DType::F32)?
         };
 
         let mut ys = ys

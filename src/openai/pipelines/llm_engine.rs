@@ -16,13 +16,13 @@ use crate::{
         sampling_params::SamplingParams,
         utils::get_created_time_secs,
     },
-    paged_attention::input_metadata::InputMetadata,
     scheduler::{
         cache_engine::{CacheConfig, CacheEngine},
         sequence::{Sequence, SequenceGroup, _Sequence},
         SchedulerConfig, SchedulerOutput,
     },
 };
+use attention_rs::InputMetadata;
 use candle_core::{Device, Result, Tensor};
 use either::Either;
 use flume::Sender;

@@ -7,27 +7,25 @@ use crate::openai::logits_processor::LogitsProcessor;
 use crate::openai::models::TokenID;
 use crate::openai::requests::StopTokens;
 use crate::openai::sampling_params::{GenerationConfig, Logprobs, TopLogprob};
+use crate::openai::{
+    conversation::{
+        default_conversation::{
+            DefaultConversation, DefaultConversationSeparators, SeparatorStyle,
+        },
+        Conversation,
+    },
+    models::{
+        deepseek::DeepSeek, gemma::Gemma, gemma3::Gemma3, glm4::GLM4, llama::Llama,
+        mistral::Mistral, phi2::Phi2, phi3::Phi, quantized_glm4::GGUFGLM4,
+        quantized_llama::GGUFLLaMa, quantized_phi3::GGUFPhi3, quantized_qwen::GGUFQWen,
+        quantized_qwen3_moe::GGUFQWenMoE, qwen::Qwen, qwen3_moe::Qwen3MoE, stable_lm::StableLM,
+        yi::Yi, Config,
+    },
+    PipelineConfig,
+};
 use crate::openai::{BosEosToken, TokenizerConfig};
 use crate::scheduler::sequence::SequenceGroup;
-use crate::{
-    openai::{
-        conversation::{
-            default_conversation::{
-                DefaultConversation, DefaultConversationSeparators, SeparatorStyle,
-            },
-            Conversation,
-        },
-        models::{
-            deepseek::DeepSeek, gemma::Gemma, gemma3::Gemma3, glm4::GLM4, llama::Llama,
-            mistral::Mistral, phi2::Phi2, phi3::Phi, quantized_glm4::GGUFGLM4,
-            quantized_llama::GGUFLLaMa, quantized_phi3::GGUFPhi3, quantized_qwen::GGUFQWen,
-            quantized_qwen3_moe::GGUFQWenMoE, qwen::Qwen, qwen3_moe::Qwen3MoE, stable_lm::StableLM,
-            yi::Yi, Config,
-        },
-        PipelineConfig,
-    },
-    paged_attention::input_metadata::InputMetadata,
-};
+use attention_rs::InputMetadata;
 use candle_core::quantized::gguf_file;
 use candle_core::{DType, Device, Result, Tensor};
 use either::Either;
