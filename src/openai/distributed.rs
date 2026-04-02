@@ -124,36 +124,36 @@ impl CustomOp1 for AllReduce {
         l: &Layout,
     ) -> Result<(candle_core::CudaStorage, Shape)> {
         use candle_core::backend::BackendStorage;
-        use candle_core::cuda_backend::cudarc::driver::DeviceSlice;
         use candle_core::cuda_backend::cudarc::nccl::safe::ReduceOp;
         use candle_core::cuda_backend::WrapErr;
         use candle_core::DType;
         use half::{bf16, f16};
 
+        if !l.is_contiguous() {
+            candle_core::bail!("Inputs for all_reduce must be contiguous!");
+        }
         let elem_count = l.shape().elem_count();
         let dev = s.device().clone();
+        let start_offset = l.start_offset();
+
         let dst = match s.dtype() {
             DType::BF16 => {
-                let s = s.as_cuda_slice::<bf16>()?;
-                let s = match l.contiguous_offsets() {
-                    Some((0, l)) if l == s.len() => s,
-                    Some(_) | None => candle_core::bail!("input has to be contiguous"),
-                };
+                let full_slice = s.as_cuda_slice::<bf16>()?;
+                // Slice to only the valid elements (handles narrow/view tensors)
+                let src_slice = full_slice.slice(start_offset..start_offset + elem_count);
                 let mut dst = unsafe { dev.alloc::<bf16>(elem_count) }.w()?;
                 self.comm
-                    .all_reduce(s, &mut dst, &ReduceOp::Sum)
+                    .all_reduce(&src_slice, &mut dst, &ReduceOp::Sum)
                     .map_err(candle_core::Error::debug)?;
                 candle_core::CudaStorage::wrap_cuda_slice(dst, dev)
             }
             DType::F16 => {
-                let s = s.as_cuda_slice::<f16>()?;
-                let s = match l.contiguous_offsets() {
-                    Some((0, l)) if l == s.len() => s,
-                    Some(_) | None => candle_core::bail!("input has to be contiguous"),
-                };
+                let full_slice = s.as_cuda_slice::<f16>()?;
+                // Slice to only the valid elements (handles narrow/view tensors)
+                let src_slice = full_slice.slice(start_offset..start_offset + elem_count);
                 let mut dst = unsafe { dev.alloc::<f16>(elem_count) }.w()?;
                 self.comm
-                    .all_reduce(s, &mut dst, &ReduceOp::Sum)
+                    .all_reduce(&src_slice, &mut dst, &ReduceOp::Sum)
                     .map_err(candle_core::Error::debug)?;
                 candle_core::CudaStorage::wrap_cuda_slice(dst, dev)
             }
@@ -360,6 +360,61 @@ impl MergedParallelColumnLinear {
         Ok(Self {
             linears: vec_linear,
             biases: vec![None; chunk],
+        })
+    }
+
+    pub fn load_merged_chunks(
+        in_dim: usize,
+        out_dim: usize,
+        chunk_dim: usize,
+        chunks: Vec<usize>,
+        vb: VarBuilder,
+        comm: Rc<Comm>,
+        quant_cfg: &Option<QuantConfig>,
+        quant: &Option<String>,
+        dtype: DType,
+    ) -> Result<Self> {
+        if quant_cfg.is_some() {
+            candle_core::bail!(
+                "Merged quantized weight is not supported at the moment, using ISQ instead!"
+            );
+        }
+        let mut vec_linear = Vec::<TensorParallelColumnLinear>::new();
+        let weight = vb.get((out_dim, in_dim), "weight")?;
+        let weight = if weight.dtype() != dtype {
+            weight.to_dtype(dtype)?
+        } else {
+            weight
+        };
+        let mut chunk_start = 0;
+        use crate::openai::models::linear::{LinearX, QLinear};
+        for chunk_idx in 0..chunks.len() {
+            let chunk_size = chunks[chunk_idx];
+            let ws = weight.narrow(chunk_dim, chunk_start, chunk_size)?;
+            let c_chunk_size = ws.dim(0)? / comm.world_size();
+            let ws_chunk = ws
+                .narrow(0, comm.rank() * c_chunk_size, c_chunk_size)?
+                .contiguous()?;
+            chunk_start += chunk_size;
+
+            let ln = crate::openai::models::linear::Linear::new(ws_chunk, None);
+            let linear = if let Some(quantized_type) = quant {
+                let quantized_type = if chunk_idx == chunks.len() - 1 {
+                    "q8_0".to_string()
+                } else {
+                    quantized_type.clone()
+                };
+                LinearX::QLinear(QLinear::from_linear_x(ln, quantized_type, quant_cfg))
+            } else {
+                LinearX::Linear(ln)
+            };
+            let ln = TensorParallelColumnLinear { linear, bias: None };
+            vec_linear.push(ln);
+        }
+
+        Ok(Self {
+            linears: vec_linear,
+            biases: vec![None; chunks.len()],
         })
     }
 }

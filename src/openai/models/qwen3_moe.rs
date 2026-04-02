@@ -7,6 +7,8 @@ use crate::openai::distributed::{
     TensorParallelRowLinear, VarBuilder,
 };
 use crate::openai::models::layers::moe::FusedMoe;
+#[cfg(not(feature = "gcu"))]
+use crate::openai::models::layers::moe::{FusedMoeFp8, FusedMoeISQ};
 use crate::openai::models::linear::LinearX as Linear;
 use crate::openai::models::mask::get_attention_causal_mask;
 use crate::openai::models::QwenMoEConfig;
@@ -118,6 +120,10 @@ impl Module for Mlp {
 #[allow(dead_code)]
 enum MoeOrMlp {
     FusedMoe(FusedMoe),
+    #[cfg(not(feature = "gcu"))]
+    FusedMoeISQ(FusedMoeISQ),
+    #[cfg(not(feature = "gcu"))]
+    FusedMoeFp8(FusedMoeFp8),
     Mlp(Mlp),
 }
 
@@ -126,6 +132,10 @@ impl MoeOrMlp {
         match self {
             Self::Mlp(m) => m.forward(xs),
             Self::FusedMoe(m) => m.forward(xs, is_prefill),
+            #[cfg(not(feature = "gcu"))]
+            Self::FusedMoeISQ(m) => m.forward(xs, is_prefill),
+            #[cfg(not(feature = "gcu"))]
+            Self::FusedMoeFp8(m) => m.forward(xs, is_prefill),
         }
     }
 }
@@ -170,8 +180,59 @@ impl DecoderLayer {
             && (moe_cfg.num_experts.unwrap_or(0) > 0
                 && (layer_idx + 1) % moe_cfg.decoder_sparse_step.unwrap_or(1) == 0)
         {
-            if cfg.quant.is_some() {
-                candle_core::bail!("Quantized MoE not supported!");
+            // Check for FP8 quantization first
+            if let Some(ref quant_cfg) = cfg.quantization_config {
+                if quant_cfg.quant_method == "fp8" {
+                    #[cfg(feature = "gcu")]
+                    {
+                        candle::bail!("FP8 MoE is not supported on GCU; use a non-fp8 checkpoint or build without the gcu feature")
+                    }
+                    #[cfg(not(feature = "gcu"))]
+                    {
+                        MoeOrMlp::FusedMoeFp8(FusedMoeFp8::new(
+                            cfg,
+                            vb.pp("mlp").clone(),
+                            comm.clone(),
+                            dtype,
+                            quant_cfg,
+                        )?)
+                    }
+                } else if cfg.quant.is_some() {
+                    #[cfg(feature = "gcu")]
+                    {
+                        candle::bail!("In-situ quantized (ISQ) MoE is not supported on GCU")
+                    }
+                    #[cfg(not(feature = "gcu"))]
+                    {
+                        MoeOrMlp::FusedMoeISQ(FusedMoeISQ::new(
+                            cfg,
+                            vb.pp("mlp").clone(),
+                            comm.clone(),
+                            dtype,
+                        )?)
+                    }
+                } else {
+                    MoeOrMlp::FusedMoe(FusedMoe::new(
+                        cfg,
+                        vb.pp("mlp").clone(),
+                        comm.clone(),
+                        dtype,
+                    )?)
+                }
+            } else if cfg.quant.is_some() {
+                #[cfg(feature = "gcu")]
+                {
+                    candle::bail!("In-situ quantized (ISQ) MoE is not supported on GCU")
+                }
+                #[cfg(not(feature = "gcu"))]
+                {
+                    MoeOrMlp::FusedMoeISQ(FusedMoeISQ::new(
+                        cfg,
+                        vb.pp("mlp").clone(),
+                        comm.clone(),
+                        dtype,
+                    )?)
+                }
             } else {
                 MoeOrMlp::FusedMoe(FusedMoe::new(
                     cfg,
@@ -337,6 +398,27 @@ impl Qwen3MoE {
         kv_caches: Option<&Vec<(Tensor, Tensor)>>,
         input_metadata: &InputMetadata,
     ) -> Result<Tensor> {
+        self.forward_inner(input_ids, input_positions, kv_caches, input_metadata, false)
+    }
+
+    pub fn forward_embedding(
+        &self,
+        input_ids: &Tensor,
+        input_positions: &Tensor,
+        kv_caches: Option<&Vec<(Tensor, Tensor)>>,
+        input_metadata: &InputMetadata,
+    ) -> Result<Tensor> {
+        self.forward_inner(input_ids, input_positions, kv_caches, input_metadata, true)
+    }
+
+    fn forward_inner(
+        &self,
+        input_ids: &Tensor,
+        input_positions: &Tensor,
+        kv_caches: Option<&Vec<(Tensor, Tensor)>>,
+        input_metadata: &InputMetadata,
+        return_hidden: bool,
+    ) -> Result<Tensor> {
         let seqlens = if input_metadata.cu_seqlens_q.is_some() {
             input_metadata
                 .cu_seqlens_q
@@ -379,12 +461,16 @@ impl Qwen3MoE {
             }
         }
 
-        if !seqlens.is_empty() {
+        if !seqlens.is_empty() && !return_hidden {
             let indices: Vec<_> = seqlens.iter().map(|x| x - 1 as u32).collect();
             let batch = indices.len();
             xs = xs.index_select(&Tensor::from_vec(indices, (batch,), xs.device())?, 0)?;
         }
         let xs = self.norm.forward(&xs)?;
+
+        if return_hidden {
+            return Ok(xs);
+        }
         self.lm_head.forward(&xs)?.to_dtype(DType::F32)
     }
 

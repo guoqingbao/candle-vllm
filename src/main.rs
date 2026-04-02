@@ -1,4 +1,5 @@
 use axum::{
+    extract::State,
     http::{self, Method},
     routing::{get, post},
     Json, Router,
@@ -6,22 +7,24 @@ use axum::{
 use candle_core::{DType, Device, Result};
 #[cfg(feature = "eccl")]
 use candle_vllm::backend::heartbeat;
-use candle_vllm::openai::openai_server::chat_completions;
+use candle_vllm::openai::models::Config;
+use candle_vllm::openai::openai_server::{chat_completions, create_embeddings};
 use candle_vllm::openai::pipelines::llm_engine::LLMEngine;
 use candle_vllm::openai::pipelines::pipeline::DefaultLoader;
 use candle_vllm::openai::sampling_params::GenerationConfig;
 use candle_vllm::openai::OpenAIServerData;
 use candle_vllm::scheduler::cache_engine::{CacheConfig, CacheEngine};
+use candle_vllm::scheduler::prefix_cache::PrefixCacheConfig;
 use candle_vllm::scheduler::SchedulerConfig;
 use clap::Parser;
-use std::sync::Arc;
-use tracing::{info, warn};
-const SIZE_IN_MB: usize = 1024 * 1024;
-use candle_vllm::openai::models::Config;
+use colored::*;
+use local_ip_address::local_ip;
 use rustchatui::start_ui_server;
 use serde_json::json;
+use std::sync::Arc;
 use tokio::sync::Notify;
 use tower_http::cors::{Any, CorsLayer};
+use tracing::{info, warn};
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
@@ -127,41 +130,28 @@ struct Args {
     #[arg(long, default_value_t = false)]
     fp8_kvcache: bool,
 
+    /// Enable prefix cache to reuse KV cache for repeated prompt prefixes.
+    #[arg(long, default_value_t = false)]
+    prefix_cache: bool,
+
+    /// Prefix cache size limit in tokens (rounded down to block size).
+    #[arg(long)]
+    prefix_cache_max_tokens: Option<usize>,
+
     #[arg(long, default_value_t = false)]
     ui_server: bool, //start candle-vllm with built-in web server
-}
 
-fn get_cache_config(
-    kvcache_mem_gpu: usize,
-    kvcache_mem_cpu: usize,
-    block_size: usize,
-    config: &Config,
-    kv_dtype: DType,
-    num_shards: usize,
-) -> CacheConfig {
-    let dsize = kv_dtype.size_in_bytes();
-    let num_gpu_blocks = kvcache_mem_gpu * SIZE_IN_MB
-        / dsize
-        / block_size
-        / (config.num_key_value_heads.unwrap() / num_shards)
-        / config.k_head_dim()
-        / config.num_hidden_layers
-        / 2;
-    let num_cpu_blocks = kvcache_mem_cpu * SIZE_IN_MB
-        / dsize
-        / block_size
-        / (config.num_key_value_heads.unwrap() / num_shards)
-        / config.k_head_dim()
-        / config.num_hidden_layers
-        / 2;
-    CacheConfig {
-        block_size,
-        num_gpu_blocks: Some(num_gpu_blocks),
-        num_cpu_blocks: Some(num_cpu_blocks),
-        fully_init: true,
-        dtype: kv_dtype,
-        kvcache_mem_gpu,
-    }
+    /// MCP server command (single server mode)
+    #[arg(long)]
+    mcp_command: Option<String>,
+
+    /// MCP server arguments (comma-separated)
+    #[arg(long, value_delimiter = ',')]
+    mcp_args: Option<Vec<String>>,
+
+    /// Path to MCP config file (multi-server mode)
+    #[arg(long)]
+    mcp_config: Option<String>,
 }
 
 fn config_log(logger: ftail::Ftail, log_enable: bool, log_file: String) -> Result<()> {
@@ -197,55 +187,6 @@ fn config_log(logger: ftail::Ftail, log_enable: bool, log_file: String) -> Resul
         .map_err(candle_core::Error::wrap)
 }
 
-fn get_dtype(dtype: Option<String>) -> DType {
-    let dtype = match dtype.as_deref() {
-        Some("f16") => DType::F16,
-        Some("bf16") => DType::BF16,
-        Some("f32") => DType::F32,
-        Some(dtype) => panic!("Unsupported dtype {dtype}"),
-        None => DType::BF16,
-    };
-
-    #[cfg(feature = "cuda")]
-    let dtype = {
-        use candle_core::cuda_backend::cudarc::driver::result::{device, init};
-        use candle_core::cuda_backend::cudarc::driver::sys::CUdevice_attribute;
-        match (init(), device::get(0)) {
-            (Ok(_), Ok(d)) => {
-                let (compute_major, compute_minor) = unsafe {
-                    (
-                        device::get_attribute(
-                            d,
-                            CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR,
-                        )
-                        .unwrap_or(8),
-                        device::get_attribute(
-                            d,
-                            CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR,
-                        )
-                        .unwrap_or(8),
-                    )
-                };
-                info!(
-                    "CUDA compute capability: {}.{}",
-                    compute_major, compute_minor,
-                );
-                if dtype != DType::F32 && compute_major < 8 {
-                    warn!(
-                        "CUDA compute capability: {} (<8), switched to F16 cause no BF16 support.",
-                        compute_major
-                    );
-                    DType::F16
-                } else {
-                    dtype
-                }
-            }
-            _ => dtype,
-        }
-    };
-    dtype
-}
-
 #[tokio::main]
 #[allow(unused_mut)]
 async fn main() -> Result<()> {
@@ -264,7 +205,7 @@ async fn main() -> Result<()> {
 
     let (paths, gguf) = loader.prepare_model_weights(args.hf_token, args.hf_token_path)?;
 
-    let dtype = get_dtype(args.dtype);
+    let dtype = candle_vllm::get_dtype(args.dtype);
     let kv_cache_dtype = if args.fp8_kvcache { DType::U8 } else { dtype };
 
     if cfg!(feature = "flash-decoding") {
@@ -433,7 +374,7 @@ async fn main() -> Result<()> {
         .into_iter()
         .map(|pipeline| {
             let cfg = pipeline.get_model_config();
-            let cache_cfg = get_cache_config(
+            let cache_cfg = candle_vllm::get_cache_config(
                 args.kvcache_mem_gpu,
                 args.kvcache_mem_cpu, //dummy 512MB for cpu
                 args.block_size,
@@ -463,10 +404,31 @@ async fn main() -> Result<()> {
     let config = config.as_ref().unwrap().clone();
     info!("Cache config {:?}", cache_config);
 
+    let total_gpu_blocks = cache_config.num_gpu_blocks.unwrap_or(0);
+    let default_prefix_cache_blocks = if total_gpu_blocks > 0 {
+        std::cmp::max(1, total_gpu_blocks / 4)
+    } else {
+        0
+    };
+    let prefix_cache_max_blocks = if args.prefix_cache {
+        let max_blocks = args
+            .prefix_cache_max_tokens
+            .map(|tokens| tokens / cache_config.block_size)
+            .unwrap_or(default_prefix_cache_blocks);
+        std::cmp::min(max_blocks, total_gpu_blocks)
+    } else {
+        0
+    };
+    let prefix_cache_config = PrefixCacheConfig {
+        enabled: args.prefix_cache,
+        max_cached_blocks: prefix_cache_max_blocks,
+    };
+
     let llm_engine = LLMEngine::new(
         pipelines,
         SchedulerConfig {
             max_num_seqs: args.max_num_seqs,
+            prefix_cache: prefix_cache_config,
         },
         &cache_config,
         &config,
@@ -508,12 +470,55 @@ async fn main() -> Result<()> {
 
     let max_model_len = pipeline_config.max_model_len;
     let kvcached_tokens = cache_config.num_gpu_blocks.unwrap() * cache_config.block_size;
+
+    let mcp_manager_config = if let Some(path) = &args.mcp_config {
+        match candle_vllm::mcp::McpManagerConfig::from_file(path) {
+            Ok(cfg) => Some(cfg),
+            Err(err) => {
+                tracing::error!("Failed to load MCP config file: {:?}", err);
+                None
+            }
+        }
+    } else if let Some(command) = args.mcp_command.clone() {
+        Some(candle_vllm::mcp::McpManagerConfig::from_single(
+            candle_vllm::mcp::manager::McpToolConfig::new(
+                command,
+                args.mcp_args.clone().unwrap_or_default(),
+            ),
+        ))
+    } else {
+        None
+    };
+
+    // Initialize MCP Manager
+    let mcp_manager = if let Some(cfg) = mcp_manager_config {
+        match candle_vllm::mcp::McpClientManager::new(cfg) {
+            Ok(manager) => Some(Arc::new(manager)),
+            Err(err) => {
+                tracing::error!("Failed to start MCP client manager: {:?}", err);
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     let server_data = OpenAIServerData {
         pipeline_config,
         model: llm_engine,
         record_conversation: args.record_conversation,
         device: Device::Cpu,
+        mcp_manager: mcp_manager.clone(),
     };
+
+    if let Some(manager) = &mcp_manager {
+        info!("Waiting for MCP tools to be available...");
+        if manager.wait_for_available(std::time::Duration::from_secs(30)) {
+            info!("MCP tools available.");
+        } else {
+            warn!("MCP tools wait timed out.");
+        }
+    }
 
     if global_rank != 0 {
         info!("\nDaemon service started at rank {}.", global_rank);
@@ -540,7 +545,23 @@ async fn main() -> Result<()> {
                 std::cmp::min(kvcached_tokens / batch, max_model_len)
             );
         }
-        warn!("Server started at http://{host}:{port}/v1/");
+        let ip = local_ip().unwrap_or("127.0.0.1".parse().unwrap());
+        let local_url = format!("http://localhost:{port}/v1/");
+        let lan_url = format!("http://{ip}:{port}/v1/");
+
+        println!(
+            "\n🧠 API server running at:\n\t{} (Local Access) \n\t{} (Remote Access)\n",
+            local_url.cyan().bold(),
+            lan_url.cyan().bold(),
+        );
+
+        println!("");
+        println!(
+            "🛑 {}",
+            format!("EXIT: Ctrl+C to quit. If unresponsive: Ctrl+P → Ctrl+Q (last resort).")
+                .bold()
+                .red()
+        );
     }
 
     let cors_layer = CorsLayer::new()
@@ -553,12 +574,17 @@ async fn main() -> Result<()> {
     let app = Router::new()
         .route(
             "/v1/models",
-            get(|| async {
+            get(|State(data): State<Arc<OpenAIServerData>>| async move {
+                let model_name = {
+                    let engine = data.model.read();
+                    let (pipeline, _) = engine.get_pipeline(0).unwrap();
+                    pipeline.name().to_string()
+                };
                 Json(json!({
                     "object": "list",
                     "data": [
                         {
-                            "id": "default",
+                            "id": model_name,
                             "object": "model",
                             "created": std::time::SystemTime::now()
                                 .duration_since(std::time::UNIX_EPOCH)
@@ -572,6 +598,7 @@ async fn main() -> Result<()> {
             }),
         )
         .route("/v1/chat/completions", post(chat_completions))
+        .route("/v1/embeddings", post(create_embeddings))
         .layer(cors_layer)
         .with_state(Arc::new(server_data));
 

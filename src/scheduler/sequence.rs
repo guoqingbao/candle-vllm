@@ -6,6 +6,8 @@ use std::{
 use super::block_engine::LogicalTokenBlock;
 use crate::openai::sampling_params::{Logprobs, SamplingParams};
 use crate::openai::streaming::ChatResponse;
+use crate::tools::stream_parser::StreamToolParser;
+use crate::tools::ToolCall;
 use flume::Sender;
 use std::time::SystemTime;
 #[derive(Clone, PartialEq)]
@@ -19,12 +21,27 @@ pub enum SequenceStatus {
     Finished(String),
 }
 
+#[derive(Clone, PartialEq, Debug)]
+pub enum ToolCallState {
+    Normal,
+    MaybeToolCall,
+    InToolCall,
+}
+
 pub struct SequenceData {
     prompt_token_ids: Vec<u32>,
     output_token_ids: Vec<Logprobs>,
     cumulative_logprob: f32,
     status: SequenceStatus,
     num_cached_tokens: usize, //used for chunked prefill and context cache
+    // Tool call and reasoning tracking
+    pub accumulated_output: String,
+    pub tool_call_state: ToolCallState,
+    pub tool_call_buffer: String,
+    pub active_reasoning_end: Option<String>,
+    pub in_code_block: bool,
+    pub stream_tool_parser: Option<StreamToolParser>,
+    pub pending_tool_calls: Vec<ToolCall>,
 }
 
 impl SequenceData {
@@ -35,6 +52,13 @@ impl SequenceData {
             cumulative_logprob: 0.,
             status: SequenceStatus::Waiting,
             num_cached_tokens: 0,
+            accumulated_output: String::new(),
+            tool_call_state: ToolCallState::Normal,
+            tool_call_buffer: String::new(),
+            active_reasoning_end: None,
+            in_code_block: false,
+            stream_tool_parser: None,
+            pending_tool_calls: Vec::new(),
         }
     }
 
@@ -253,7 +277,16 @@ pub struct SequenceGroup {
     pub created_time: SystemTime,
     pub sampling_params: SamplingParams,
     pub use_logprobs: bool,
+    pub is_embedding: bool,
+    pub encoding_format: crate::openai::requests::EncodingFormat,
+    pub embedding_type: crate::openai::requests::EmbeddingType,
     pub sender: Option<Sender<ChatResponse>>,
+    // Tool call and reasoning tracking
+    pub accumulated_output: String,
+    pub tool_call_state: ToolCallState,
+    pub tool_call_buffer: String,
+    pub active_reasoning_end: Option<String>,
+    pub in_code_block: bool,
 }
 
 impl SequenceGroup {
@@ -266,6 +299,9 @@ impl SequenceGroup {
         created_time: SystemTime,
         sampling_params: SamplingParams,
         use_logprobs: bool,
+        is_embedding: bool,
+        encoding_format: crate::openai::requests::EncodingFormat,
+        embedding_type: crate::openai::requests::EmbeddingType,
         sender: Option<Sender<ChatResponse>>,
     ) -> Self {
         let mut seq_map = HashMap::new();
@@ -280,7 +316,15 @@ impl SequenceGroup {
             created_time,
             sampling_params,
             use_logprobs,
+            is_embedding,
+            encoding_format,
+            embedding_type,
             sender,
+            accumulated_output: "".to_string(),
+            tool_call_state: ToolCallState::Normal,
+            tool_call_buffer: String::new(),
+            active_reasoning_end: None,
+            in_code_block: false,
         }
     }
 

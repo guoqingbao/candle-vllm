@@ -11,15 +11,6 @@ pub struct APIError {
     data: String,
 }
 
-// impl error::ResponseError for APIError {
-//     fn error_response(&self) -> HttpResponse {
-//         //pack error to json so that client can handle it
-//         HttpResponse::BadRequest()
-//             .content_type("application/json")
-//             .json(self.data.to_string())
-//     }
-// }
-
 impl APIError {
     pub fn new(data: String) -> Self {
         Self { data }
@@ -32,7 +23,6 @@ impl APIError {
     }
 
     pub fn from<T: ToString>(value: T) -> Self {
-        //panic!("{}", value.to_string());
         Self::new(value.to_string())
     }
 }
@@ -60,11 +50,12 @@ pub struct ChatCompletionUsageResponse {
     pub completion_time_costs: usize, //milliseconds
 }
 
-// tool_calls, function_call not supported!
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatChoiceData {
     pub content: Option<String>,
     pub role: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<crate::tools::ToolCall>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -90,11 +81,12 @@ pub struct ChatCompletionResponse {
     pub usage: ChatCompletionUsageResponse,
 }
 
-// tool_calls, function_call not supported!
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChoiceData {
     pub content: Option<String>,
     pub role: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<crate::tools::ToolCall>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -137,6 +129,7 @@ impl ErrorToResponse for JsonError {}
 pub enum ChatResponder {
     Streamer(Sse<Streamer>),
     Completion(ChatCompletionResponse),
+    Embedding(EmbeddingResponse),
     ModelError(APIError),
     InternalError(APIError),
     ValidationError(APIError),
@@ -147,6 +140,7 @@ impl IntoResponse for ChatResponder {
         match self {
             ChatResponder::Streamer(s) => s.into_response(),
             ChatResponder::Completion(s) => Json(s).into_response(),
+            ChatResponder::Embedding(s) => Json(s).into_response(),
             ChatResponder::InternalError(e) => {
                 JsonError::new(e.to_string()).to_response(http::StatusCode::INTERNAL_SERVER_ERROR)
             }
@@ -158,4 +152,32 @@ impl IntoResponse for ChatResponder {
             }
         }
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum EmbeddingOutput {
+    Vector(Vec<f32>),
+    Base64(String),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EmbeddingData {
+    pub object: &'static str,
+    pub embedding: EmbeddingOutput,
+    pub index: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EmbeddingUsage {
+    pub prompt_tokens: usize,
+    pub total_tokens: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EmbeddingResponse {
+    pub object: &'static str,
+    pub data: Vec<EmbeddingData>,
+    pub model: String,
+    pub usage: EmbeddingUsage,
 }

@@ -24,6 +24,9 @@ Efficient, easy-to-use platform for inference and serving local LLMs including a
 - Support `Multi-node` inference with MPI runner
 - Support Chunked Prefilling (default chunk size 8K)
 - Support CUDA Graph
+- Support Model Context Protocol (MCP) and OpenAI-compatible tool calling
+- Support Prefix Caching
+- Support Block-wise FP8 Models (SM90+, Qwen3 Series)
 
 ## Supported Models
 - Currently, candle-vllm supports chat serving for the following model structures.
@@ -61,43 +64,78 @@ Efficient, easy-to-use platform for inference and serving local LLMs including a
   </details>
 
 ## General Usage
-### Build Candle-vLLM
+### Install Candle-vLLM
 
+**Clone code**
 ```shell
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh #install rust, 1.83.0+ required
-sudo apt install libssl-dev pkg-config -y
 git clone git@github.com:EricLBuehler/candle-vllm.git
 cd candle-vllm
-
-## Mac/Metal (single-node only)
-cargo build --release --features metal
-
-#Make sure the CUDA Toolkit can be found in the system PATH
-export PATH=$PATH:/usr/local/cuda/bin/
-
-#CUDA: single-node compilation (single gpu, or multi-gpus on single machine)
-cargo build --release --features cuda,nccl
-
-#CUDA: single-node compilation (+CUDA Graph)
-cargo build --release --features cuda,nccl,graph
-
-#CUDA: single-node compilation with flash attention for prefill only (requires CUDA_ARCH >= 800)
-cargo build --release --features cuda,nccl,graph,flash-attn
-
-#CUDA: single-node compilation with flash attention for both prefill and decoding 
-#(takes few minutes for the first build, faster inference for long-context, requires CUDA_ARCH >= 800)
-cargo build --release --features cuda,nccl,graph,flash-attn,flash-decoding
-
-#CUDA: multinode compilation with MPI (multi-gpus, multiple machines)
-sudo apt update
-sudo apt install libopenmpi-dev openmpi-bin -y #install mpi
-sudo apt install clang libclang-dev
-cargo build --release --features cuda,nccl,mpi #build with mpi feature
-# or
-cargo build --release --features cuda,nccl,flash-attn,mpi #build with flash-attn and mpi features
 ```
 
-### Build/Run Parameters
+**CUDA (CUDA 11+, 12+, 13.0)**
+ > Option 1 (Install into docker)
+```bash
+# Use one of the following commands:
+
+# `flash-decoding` takes longer time to build (pass hardware arch and cuda version)
+./build_docker.sh "cuda,nccl,graph,flash-attn,flash-decoding" sm_80 12.9.0
+
+# +cutlass feature for optimized fp8 models (Qwen3 series, sm90+) with CUDA 13
+./build_docker.sh "cuda,nccl,graph,flash-attn,flash-decoding,cutlass" sm_90 13.0.0
+
+# Use Rust crate China Mirror (used in Chinese Mainland)
+./build_docker.sh "cuda,nccl,graph,flash-attn,flash-decoding" sm_80 12.9.0 1
+```
+
+ > Option 2 (Manual Installation)
+
+Install dependencies
+```shell
+sudo apt update
+# Install CUDA toolkit (optional)
+sudo apt install git libssl-dev pkg-config curl -y
+sudo apt install -y cuda-toolkit-12-9
+# Install rust, 1.83.0+ required
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+
+# Make sure the CUDA Toolkit can be found in the system PATH
+export PATH=$PATH:/usr/local/cuda/bin/
+```
+
+Install for single node inference (use one of the commands)
+```shell
+cargo install --release --features cuda,nccl --path .
+
+# +CUDA Graph
+cargo install --features cuda,nccl,graph --path .
+
+# +Flash attention for prefill only (sm_80+)
+cargo install --features cuda,nccl,graph,flash-attn --path .
+
+# +Flash attention for both prefill and decoding (sm_80+)
+cargo install --features cuda,nccl,graph,flash-attn,flash-decoding --path .
+```
+
+Install for multinode inference
+```shell
+# Use MPI (multi-gpus on multiple machines)
+sudo apt install libopenmpi-dev openmpi-bin -y #install mpi
+sudo apt install clang libclang-dev
+cargo install --features cuda,nccl,mpi --path . #install with mpi feature
+# or
+cargo install --features cuda,nccl,flash-attn,flash-decoding,mpi --path .
+```
+
+**Mac/Metal (single-node only)**
+
+Install [Xcode command line tools](https://mac.install.guide/commandlinetools/)
+
+Install with `metal` feature
+```shell
+cargo install --features metal --path .
+```
+
+### Run Directly (Without installation)
 
 - [`ENV_PARAM`] cargo run [`BUILD_PARAM`] -- [`PROGRAM_PARAM`] [`MODEL_ID/MODEL_WEIGHT_PATH`] [`CACHE CONFIG`] [`WEB UI`]
   <details open>
@@ -106,12 +144,12 @@ cargo build --release --features cuda,nccl,flash-attn,mpi #build with flash-attn
     **Example:**
 
     ```shell
-    [RUST_LOG=warn] cargo run [--release --features cuda,nccl] -- [--log --dtype bf16 --p 2000 --d 0,1 --mem 4096 --isq q4k --prefill-chunk-size 8192 --frequency-penalty 1.1 --presence-penalty 1.1] [--w /home/weights/Qwen3-30B-A3B-Instruct-2507] [--fp8-kvcache] [--ui-server]
+    [RUST_LOG=warn] cargo run [--release --features cuda,nccl,graph] -- [--log --dtype bf16 --p 2000 --d 0,1 --mem 4096 --isq q4k --prefill-chunk-size 8192 --frequency-penalty 1.1 --presence-penalty 1.1] [--w /home/weights/Qwen3-30B-A3B-Instruct-2507] [--fp8-kvcache] [--ui-server]
     ```
 
     `ENV_PARAM`: RUST_LOG=warn
 
-    `BUILD_PARAM`: --release --features cuda,nccl
+    `BUILD_PARAM`: --release --features cuda,nccl,graph
 
     `PROGRAM_PARAM`：--log --dtype bf16 --p 2000 --d 0,1 --mem 4096 --isq q4k --prefill-chunk-size 8192 --frequency-penalty 1.1 --presence-penalty 1.1
 
@@ -121,29 +159,48 @@ cargo build --release --features cuda,nccl,flash-attn,mpi #build with flash-attn
 
     `WEB UI`: --ui-server
 
-    where, `--p`: server port; `--d`: device ids; `--w`: weight path (safetensors folder); `--f`: weight file (for gguf); `--m`: huggingface model-id; `--isq q4k`: convert weights into `q4k` format during model loading; `--prefill-chunk-size` chunk the prefill into size defined in this flag (default 8K, `0` for disable); `--frequency-penalty` and `presence-penalty` repetition penalty (value from -2.0 to 2.0); `--mem` (`kvcache-mem-gpu`) is the key parameter to control KV cache usage (increase this for large batch); `--fp8-kvcache` used to enable fp8 kvcache; `--ui-server` start with a built-in ChatGPT-like Web UI sever.
+    where, `--p`: server port; `--d`: device ids; `--w`: weight path (safetensors folder); `--f`: weight file (for gguf); `--m`: huggingface model-id; `--isq q4k`: convert weights into `q4k` format during model loading; `--prefill-chunk-size` chunk the prefill into size defined in this flag (default 8K, `0` for disable); `--frequency-penalty` and `--presence-penalty` repetition penalty (value from -2.0 to 2.0); `--mem` (`kvcache-mem-gpu`) is the key parameter to control KV cache usage (increase this for large batch); `--fp8-kvcache` used to enable fp8 kvcache; `--prefix-cache` enable prefix cache reuse; `--prefix-cache-max-tokens` cap prefix cache size; `--ui-server` start with a built-in ChatGPT-like Web UI sever.
   </details>
 
 
 
-## How to run?
+## How to serve models?
+
+- **Note:** for docker build, execute the following command to enter docker:
+
+```shell
+docker run --rm -it --gpus all --network host -v /home:/home -v /data:/data candle-vllm:latest bash
+```
 
 - Run **Uncompressed** models 
   <details open>
     <summary>Show command</summary>
 
-    **Local Path (with port, device and isq specified)**
-
+    **Local Path (with port, device)**
     ```shell
-    target/release/candle-vllm --p 2000 --d 0,1 --w /home/Qwen3-30B-A3B-Instruct-2507/ --isq q4k --ui-server
+    candle-vllm --p 8000 --d 0,1 --w /home/Qwen3-30B-A3B-Instruct-2507/ --prefix-cache
+    ```
+
+    **Local Path (ISQ, +UI Server)**
+    ```shell
+    candle-vllm --p 8000 --d 0,1 --w /home/Qwen3-30B-A3B-Instruct-2507/ --isq q4k --ui-server --prefix-cache
     ```
 
     **Model-ID (download from Huggingface)**
 
     ```shell
-    target/release/candle-vllm --m deepseek-ai/DeepSeek-R1-0528-Qwen3-8B --ui-server
+    candle-vllm --m deepseek-ai/DeepSeek-R1-0528-Qwen3-8B --ui-server --prefix-cache
     ```
 
+    **FP8 Model** (block-wise quant, build with `cutlass` feature)
+    ```shell
+    candle-vllm --w Qwen/Qwen3-Coder-30B-A3B-Instruct-FP8/ --ui-server --prefix-cache
+    ```
+
+    ```shell
+     # MacOS/Metal (Dense)
+    candle-vllm --m Qwen/Qwen3-4B-Instruct-2507-FP8 --ui-server --prefix-cache
+    ```
   </details>
 
 - Run **GGUF** models 
@@ -153,13 +210,13 @@ cargo build --release --features cuda,nccl,flash-attn,mpi #build with flash-attn
     **Local Path**
 
     ```shell
-    target/release/candle-vllm --f /home/data/Qwen3-30B-A3B-Instruct-2507-Q4_K_M.gguf --ui-server
+    candle-vllm --f /home/data/Qwen3-30B-A3B-Instruct-2507-Q4_K_M.gguf --ui-server
     ```
 
     **Model-ID (download from Huggingface)**
 
     ```shell
-    target/release/candle-vllm --m unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF --f Qwen3-30B-A3B-Instruct-2507-Q4_K_M.gguf --ui-server
+    candle-vllm --m unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF --f Qwen3-30B-A3B-Instruct-2507-Q4_K_M.gguf --ui-server
     ```
 
   </details>
@@ -171,13 +228,13 @@ cargo build --release --features cuda,nccl,flash-attn,mpi #build with flash-attn
     **Local Path (assume model downloaded in /home)**
 
     ```shell
-    cargo run --release --features metal -- --f /home/qwq-32b-q4_k_m.gguf --ui-server
+    candle-vllm --f /home/qwq-32b-q4_k_m.gguf --ui-server
     ```
 
     **Model-ID (download from Huggingface)**
 
     ```shell
-    cargo run --release --features metal -- --m Qwen/QwQ-32B-GGUF --f qwq-32b-q4_k_m.gguf --ui-server
+    candle-vllm --m Qwen/QwQ-32B-GGUF --f qwq-32b-q4_k_m.gguf --ui-server
     ```
 
   </details>
@@ -189,7 +246,7 @@ cargo build --release --features cuda,nccl,flash-attn,mpi #build with flash-attn
     **Simply add `isq` parameter when running unquantized models**
 
     ```shell
-    target/release/candle-vllm --p 2000 --w /home/DeepSeek-R1-Distill-Llama-8B/ --isq q4k
+    candle-vllm --p 2000 --w /home/DeepSeek-R1-Distill-Llama-8B/ --isq q4k
     ```
 
     Options for in-site `isq` parameters: ["q4_0", "q4_1", "q5_0", "q5_1", "q8_0", "q2k", "q3k","q4k","q5k","q6k"]
@@ -203,19 +260,19 @@ cargo build --release --features cuda,nccl,flash-attn,mpi #build with flash-attn
     **Local Path**
 
     ```shell
-    target/release/candle-vllm --w /home/DeepSeek-R1-Distill-Qwen-14B-GPTQ_4bit-128g
+    candle-vllm --w /home/DeepSeek-R1-Distill-Qwen-14B-GPTQ_4bit-128g
     ```
 
     **Model-ID (download from Huggingface)**
 
     ```shell
-    target/release/candle-vllm --m thesven/Llama-3-8B-GPTQ-4bit
+    candle-vllm --m thesven/Llama-3-8B-GPTQ-4bit
     ```
 
     **Convert Any uncompressed model to marlin-compatible format**
     ```shell
     python3 examples/convert_marlin.py --src /home/DeepSeek-R1-Distill-Qwen-14B/ --dst /home/DeepSeek-R1-Distill-Qwen-14B-GPTQ_4bit-128g
-    target/release/candle-vllm --w /home/DeepSeek-R1-Distill-Qwen-14B-GPTQ_4bit-128g
+    candle-vllm --w /home/DeepSeek-R1-Distill-Qwen-14B-GPTQ_4bit-128g
     ```
 
   </details>
@@ -231,7 +288,7 @@ cargo build --release --features cuda,nccl,flash-attn,mpi #build with flash-attn
 
     **Run the converted AWQ model**
     ```shell
-    target/release/candle-vllm --d 0 --w /home/Meta-Llama-3.1-8B-Instruct-AWQ-INT4-Marlin/
+    candle-vllm --d 0 --w /home/Meta-Llama-3.1-8B-Instruct-AWQ-INT4-Marlin/
     ```
 
   </details>
@@ -241,7 +298,7 @@ cargo build --release --features cuda,nccl,flash-attn,mpi #build with flash-attn
     <summary>Show command</summary>
 
     ```shell
-    target/release/candle-vllm --w /home/DeepSeek-R1-Distill-Qwen-14B-GPTQ-Marlin/
+    candle-vllm --w /home/DeepSeek-R1-Distill-Qwen-14B-GPTQ-Marlin/
     ```
 
   </details>
@@ -253,7 +310,7 @@ cargo build --release --features cuda,nccl,flash-attn,mpi #build with flash-attn
 
     **QwQ-32B BF16 model on two GPUs**
     ```shell
-    cargo run --release --features cuda,nccl -- --d 0,1 --w /home/QwQ-32B/
+    candle-vllm --d 0,1 --w /home/QwQ-32B/
     ```
 
     **QwQ-32B 4-bit AWQ model on two GPUs**
@@ -265,7 +322,7 @@ cargo build --release --features cuda,nccl,flash-attn,mpi #build with flash-attn
 
     2) Run the converted AWQ model
     ```shell
-    cargo run --release --features cuda,nccl -- --d 0,1 --w /home/QwQ-32B-AWQ-Marlin/
+    candle-vllm --d 0,1 --w /home/QwQ-32B-AWQ-Marlin/
     ```
 
     **Note:** number of GPUs (`--d`) used must be aligned to 2^n (e.g., 2, 4, or 8).
@@ -279,7 +336,7 @@ cargo build --release --features cuda,nccl,flash-attn,mpi #build with flash-attn
 
     **QwQ-32B BF16 model on two GPUs**
     ```shell
-    cargo run --release --features cuda,nccl -- --multithread --d 0,1 --w /home/QwQ-32B/
+    candle-vllm --multithread --d 0,1 --w /home/QwQ-32B/
     ```
 
     If you encountered problems under Multi-threaded Multi-GPU mode, you may:
@@ -300,7 +357,7 @@ cargo build --release --features cuda,nccl,flash-attn,mpi #build with flash-attn
 
     **2. Run DeepSeek-R1 model on 8 x A100(40GB)**
     ```shell
-    cargo run --release --features cuda,nccl -- --log --d 0,1,2,3,4,5,6,7 --w /data/DeepSeek-R1-AWQ-Marlin/--num-experts-offload-per-rank 15
+    candle-vllm --log --d 0,1,2,3,4,5,6,7 --w /data/DeepSeek-R1-AWQ-Marlin/--num-experts-offload-per-rank 15
     ```
 
     **Note:** This setup offloads 15 experts per rank (a total of 120 out of 256 experts) to the CPU (around 150GB additional host memory required). During inference, these offloaded experts are swapped back into GPU memory as needed. If you have even less GPU memory, consider increasing the `--num-experts-offload-per-rank` parameter (up to a maximum of 32 experts per rank in this case).
@@ -317,7 +374,7 @@ cargo build --release --features cuda,nccl,flash-attn,mpi #build with flash-attn
     sudo apt install libopenmpi-dev openmpi-bin -y #install mpi
     sudo apt install clang libclang-dev
     #clone the repo on the same directory of the two node and build
-    cargo build --release --features cuda,nccl,mpi #build with mpi feature
+    cargo install --features cuda,nccl,mpi #build with mpi feature
     ```
 
     **2. Convert AWQ deepseek to Marlin-compatible format**
@@ -337,7 +394,7 @@ cargo build --release --features cuda,nccl,flash-attn,mpi #build with flash-attn
 
     **4. Run the model on two nodes with MPI runner**
     ```shell
-    sudo mpirun -np 16 -x RUST_LOG=info -hostfile ./hostfile --allow-run-as-root -bind-to none -map-by slot --mca plm_rsh_args "-p 22" --mca btl_tcp_if_include %NET_INTERFACE% target/release/candle-vllm --log --d 0,1,2,3,4,5,6,7 --w /data/DeepSeek-R1-AWQ-Marlin/
+    sudo mpirun -np 16 -x RUST_LOG=info -hostfile ./hostfile --allow-run-as-root -bind-to none -map-by slot --mca plm_rsh_args "-p 22" --mca btl_tcp_if_include %NET_INTERFACE% candle-vllm --log --d 0,1,2,3,4,5,6,7 --w /data/DeepSeek-R1-AWQ-Marlin/
     ```
   </details>
 
@@ -355,50 +412,25 @@ cargo build --release --features cuda,nccl,flash-attn,mpi #build with flash-attn
     To achieve optimal performance during inference using all GPUs, use the following NUMA binding:
 
     ```shell
-    MAP_NUMA_NODE=0,0,0,0,1,1,1,1 numactl --cpunodebind=0 --membind=0 target/release/candle-vllm --d 0,1,2,3,4,5,6,7 --w /home/data/DeepSeek-V2-Chat-AWQ-Marlin
+    MAP_NUMA_NODE=0,0,0,0,1,1,1,1 numactl --cpunodebind=0 --membind=0 candle-vllm --d 0,1,2,3,4,5,6,7 --w /home/data/DeepSeek-V2-Chat-AWQ-Marlin
     ```
 
     To use only 4 GPUs, you can apply this NUMA binding:
     
     ```shell
-    MAP_NUMA_NODE=0,0,0,0 numactl --cpunodebind=0 --membind=0 target/release/candle-vllm --d 0,1,2,3 --w /home/data/DeepSeek-V2-Chat-AWQ-Marlin
+    MAP_NUMA_NODE=0,0,0,0 numactl --cpunodebind=0 --membind=0 candle-vllm --d 0,1,2,3 --w /home/data/DeepSeek-V2-Chat-AWQ-Marlin
     ```
     *where* `numactl --cpunodebind=0 --membind=0` above indicates NUMA binding for the master rank (master process) which should be matched to `MAP_NUMA_NODE`.
 
     Note: The exact NUMA binding sequence may vary depending on your hardware configuration.
   </details>
 
-- Run **Qwen3-Reranker**
-  <details>
-    <summary>Show command</summary>
-
-    1) Start the backend service for `Qwen3-Reranker` model
-    ```shell
-    target/release/candle-vllm --p 2000 --f /home/data/Qwen3-Reranker-4B-q4_k_m.gguf
-    ```
-
-    2) Start the chatbot with `system prompt` for qwen3-reranker
-    ```shell
-    python3 examples/chat.py --thinking True --system_prompt "Judge whether the Document meets the requirements based on the Query and the Instruct provided. Note that the answer can only be \"yes\" or \"no\"."
-    ```
-
-    3) Chat with chatbot for any query/doc pairs, for example,
-    ```shell
-    <Query>: What is the capital of China?\n\n<Document>: The capital of China is Beijing.
-    ```
-
-    Observe the answer:
-    
-    ```shell
-    🙋 Please Input (Ctrl+C to start a new chat or exit): <Query>: What is the capital of China?\n\n<Document>: The capital of China is Beijing.
-    Candle-vLLM: ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
-    <think>
-    Okay, the user is asking for the capital of China. The document provided is a direct answer: "The capital of China is Beijing." I need to check if this is correct. From my knowledge, Beijing is indeed the capital of China. The answer is correct and straightforward. The document meets the requirement as it provides the accurate information. So the answer is yes.
-    </think>
-
-    yes
-    ```
-  </details>
+## 📚 Additional Docs
+- [Rust Crate Usage](docs/rust_crate.md)
+- [Embedding Model Usage](docs/embedding.md)
+- [MCP & Tool Calling](docs/mcp_tool_calling.md)
+- [Prefix Cache](docs/prefix_cache.md)
+- [Work with Goose AI Agent](docs/goose.md)
 
 ## How to send request(s) to the backend?
 
@@ -589,7 +621,7 @@ Chat frontend (any frontend compatible with openai API, simple options available
     **For unquantized models:**
 
     ```
-    cargo run --release --features cuda -- --p 2000 --w /home/Meta-Llama-3.1-8B-Instruct/ --isq q4k
+    candle-vllm --p 2000 --w /home/Meta-Llama-3.1-8B-Instruct/ --isq q4k
     ```
 
     Options for `isq` parameters: ["q4_0", "q4_1", "q5_0", "q5_1", "q8_0", "q2k", "q3k","q4k","q5k","q6k"]
@@ -597,7 +629,7 @@ Chat frontend (any frontend compatible with openai API, simple options available
     **For quantized 4-bit GPTQ model:**
 
     ```
-    cargo run --release --features cuda -- --p 2000 --w /home/mistral_7b-int4/
+    candle-vllm --p 2000 --w /home/mistral_7b-int4/
     ```
 
     **Please note for marlin**:
@@ -620,7 +652,7 @@ Chat frontend (any frontend compatible with openai API, simple options available
     For chat streaming, the `stream` flag in chat request need to be set to `True`.
 
     ```
-    cargo run --release --features cuda -- --p 2000 --w /home/mistral_7b/
+    candle-vllm --p 2000 --w /home/mistral_7b/
     ```
 
     `--max-gen-tokens` parameter is used to control the maximum output tokens per chat response. The value will be set to 1/5 of max_sequence_len by default.
@@ -628,7 +660,7 @@ Chat frontend (any frontend compatible with openai API, simple options available
     For `consumer GPUs`, it is suggested to run the models under GGML formats (or Marlin format), e.g.,
 
     ```
-    cargo run --release --features cuda -- --p 2000 --w /home/Meta-Llama-3.1-8B-Instruct/ --isq q4k
+    candle-vllm --p 2000 --w /home/Meta-Llama-3.1-8B-Instruct/ --isq q4k
     ```
 
     where `isq` is one of ["q4_0", "q4_1", "q5_0", "q5_1", "q8_0", "q2k", "q3k","q4k","q5k","q6k", "awq", "gptq", "marlin", "gguf", "ggml"].
@@ -641,14 +673,14 @@ Chat frontend (any frontend compatible with openai API, simple options available
     Candle-vllm now supports GPTQ/AWQ Marlin kernel, you can run these models directly, such as:
 
     ```shell
-    cargo run --release --features cuda -- --dtype f16 --w /home/Meta-Llama-3.1-8B-Instruct-GPTQ-INT4-Marlin/
+    candle-vllm --dtype f16 --w /home/Meta-Llama-3.1-8B-Instruct-GPTQ-INT4-Marlin/
     ```
 
     or, convert existing AWQ 4bit model to marlin compatible format
 
     ```shell
     python3 examples/convert_awq_marlin.py --src /home/Meta-Llama-3.1-8B-Instruct-AWQ-INT4/ --dst /home/Meta-Llama-3.1-8B-Instruct-AWQ-INT4-Marlin/ --bits 4 --method awq --group 128 --nk False
-    cargo run --release --features cuda,nccl -- --dtype f16 --d 0 --w /home/Meta-Llama-3.1-8B-Instruct-AWQ-INT4-Marlin/
+    candle-vllm --dtype f16 --d 0 --w /home/Meta-Llama-3.1-8B-Instruct-AWQ-INT4-Marlin/
     ```
 
     You may also use `GPTQModel` to transform a model to marlin-compatible format using the given script `examples/convert_marlin.py`. 

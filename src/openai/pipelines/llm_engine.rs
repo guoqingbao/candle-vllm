@@ -5,13 +5,14 @@ use crate::openai::pipelines::TokenOrFinishReason;
 use crate::openai::streaming::ChatResponse;
 use crate::openai::TaskData;
 use crate::scheduler::Scheduler;
-#[allow(unused_imports)]
+use crate::tools::stream_parser::{ParserState, StreamResult, StreamToolParser};
 use crate::{
     openai::{
         models::Config,
         responses::{
             ChatChoice, ChatChoiceData, ChatCompletionChunk, ChatCompletionUsageResponse, Choice,
-            ChoiceData, WrapperLogprobs,
+            ChoiceData, EmbeddingData, EmbeddingOutput, EmbeddingResponse, EmbeddingUsage,
+            WrapperLogprobs,
         },
         sampling_params::SamplingParams,
         utils::get_created_time_secs,
@@ -31,6 +32,7 @@ use parking_lot::RwLock;
 use rayon::iter::IntoParallelRefIterator;
 #[cfg(feature = "eccl")]
 use rayon::iter::ParallelIterator;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::SystemTime;
 use std::{
     collections::{HashMap, VecDeque},
@@ -52,15 +54,15 @@ const PREFILL_CHUNK_SIZE: usize = 4096;
 
 #[allow(unused)]
 pub struct LLMEngine {
-    pipelines: HashMap<usize, (Box<DefaultPipeline>, CacheEngine)>,
+    pub pipelines: HashMap<usize, (Box<DefaultPipeline>, CacheEngine)>,
     pub scheduler: Scheduler,
     seq_id: usize,
     cache_config: CacheConfig,
-    config: Config,
+    pub config: Config,
     group_id: usize,
     pub notify: Arc<Notify>,
-    sync_notifies: HashMap<String, Option<Arc<Notify>>>,
-    senders: HashMap<String, Option<Arc<Sender<ChatResponse>>>>,
+    pub sync_notifies: HashMap<String, Option<Arc<Notify>>>,
+    pub senders: HashMap<String, Option<Arc<Sender<ChatResponse>>>>,
     pub completion_records: HashMap<String, (Vec<ChatChoice>, ChatCompletionUsageResponse)>,
     sequence_groups: RwLock<VecDeque<Arc<SequenceGroup>>>,
     multi_process: bool,
@@ -69,6 +71,7 @@ pub struct LLMEngine {
     #[cfg(feature = "eccl")]
     pub daemon_manager: RwLock<Option<DaemonManager>>,
     prefill_chunk_size: Option<usize>,
+    pub exit_flag: Arc<AtomicBool>,
 }
 
 impl LLMEngine {
@@ -132,6 +135,7 @@ impl LLMEngine {
             sync_notifies: HashMap::new(),
             senders: HashMap::new(),
             prefill_chunk_size,
+            exit_flag: Arc::new(AtomicBool::new(false)),
         }));
         let engine_clone = engine.clone();
 
@@ -148,8 +152,14 @@ impl LLMEngine {
         let _ = tokio::task::spawn_blocking(move || {
             tokio::runtime::Handle::current().block_on(async move {
                 loop {
+                    if engine.read().exit_flag.load(Ordering::Relaxed) {
+                        break;
+                    }
                     if is_master_rank {
                         notify.notified().await;
+                        if engine.read().exit_flag.load(Ordering::Relaxed) {
+                            break;
+                        }
                         let _ = tokio::time::sleep(tokio::time::Duration::from_millis(holding_time as u64)).await;
                     }
                     {
@@ -254,6 +264,9 @@ impl LLMEngine {
                             task.created,
                             &task.sampling_params,
                             task.use_logprobs,
+                            task.is_embedding,
+                            task.encoding_format,
+                            task.embedding_type,
                             None,
                         );
                         tracing::debug!("Daemon process: add_sequence to group {}", task.group_id);
@@ -294,6 +307,9 @@ impl LLMEngine {
                     task.created,
                     &task.sampling_params,
                     task.use_logprobs,
+                    task.is_embedding,
+                    task.encoding_format.clone(),
+                    task.embedding_type.clone(),
                     sender,
                 );
                 tracing::debug!("Main process: add_sequence to group {}", task.group_id);
@@ -348,14 +364,16 @@ impl LLMEngine {
         request_id: String,
         created: u64,
         content: Option<String>,
+        tool_calls: Option<Vec<crate::tools::ToolCall>>,
         finish_reason: Option<String>,
         pipeline: &DefaultPipeline,
     ) -> ChatCompletionChunk {
         let mut choices = Vec::new();
         let choice = Choice {
             delta: ChoiceData {
-                role: pipeline.get_past_conversation().get_roles().0.clone(),
+                role: "assistant".to_string(),
                 content,
+                tool_calls,
             },
             finish_reason,
             index: 0,
@@ -470,7 +488,16 @@ impl LLMEngine {
                 let mut e = engine.write();
                 let scheduler_outputs = e.scheduler.schedule();
                 if !scheduler_outputs.ignored_seq_groups.is_empty() {
-                    todo!();
+                    for group in scheduler_outputs.ignored_seq_groups.iter() {
+                        if let Some(sender) = &group.sender {
+                            let _ = sender.send(ChatResponse::ModelError(
+                                candle_core::Error::msg(
+                                    "Ignored sequence group: allocation impossible",
+                                )
+                                .to_string(),
+                            ));
+                        }
+                    }
                 }
                 #[cfg(not(feature = "gcu"))]
                 e.execute_scheduler_ops(&scheduler_outputs, 0).unwrap();
@@ -492,11 +519,13 @@ impl LLMEngine {
             }
 
             let seqs = scheduled[0].get_seqs();
+            let is_embedding = scheduled[0].is_embedding;
             //run partial models in parallel
-            let (mut logits, is_prompt) = {
+            let (mut logits, is_prompt, model_name) = {
                 let e = engine.read();
                 let (pipeline, cache_engine) = e.get_pipeline(rank).unwrap();
                 let device = pipeline.device();
+                let model_name = pipeline.name().to_string();
                 let PreparedInputs {
                     tokens,
                     positions,
@@ -507,15 +536,95 @@ impl LLMEngine {
                     e.prepare_decode(&scheduled, device)
                 }?;
 
-                let x = pipeline.forward(
-                    tokens,
-                    &positions,
-                    Some(&cache_engine.get_kv_cache()),
-                    &metadata,
-                )?;
+                let x = if is_embedding {
+                    pipeline.forward_embedding(
+                        tokens,
+                        &positions,
+                        Some(&cache_engine.get_kv_cache()),
+                        &metadata,
+                    )?
+                } else {
+                    pipeline.forward(
+                        tokens,
+                        &positions,
+                        Some(&cache_engine.get_kv_cache()),
+                        &metadata,
+                    )?
+                };
 
-                (x, metadata.is_prefill)
+                (x, metadata.is_prefill, model_name)
             };
+
+            if is_embedding {
+                if is_prompt {
+                    let mut e = engine.write();
+                    //Process embedding response
+                    let mut start_idx = 0;
+                    for group in &scheduled {
+                        let seq = group.get_seqs().values().nth(0).unwrap();
+                        let prompt_len = seq.deref().get_prompt_len();
+                        let end_idx = start_idx + prompt_len;
+
+                        //extract sequence embedding
+                        let seq_embedding = logits.narrow(0, start_idx, prompt_len)?;
+
+                        //Pooling
+                        let pooled_embedding = match group.embedding_type {
+                            crate::openai::requests::EmbeddingType::Last => {
+                                seq_embedding.narrow(0, prompt_len - 1, 1)?.squeeze(0)?
+                            }
+                            crate::openai::requests::EmbeddingType::Mean => {
+                                seq_embedding.mean(0)?
+                            }
+                        };
+                        info!("Resulting embedding shape: {:?}", pooled_embedding.shape());
+
+                        let vec_embedding = pooled_embedding
+                            .to_dtype(candle_core::DType::F32)?
+                            .to_vec1::<f32>()?;
+
+                        let output = match group.encoding_format {
+                            crate::openai::requests::EncodingFormat::Float => {
+                                EmbeddingOutput::Vector(vec_embedding)
+                            }
+                            crate::openai::requests::EncodingFormat::Base64 => {
+                                use base64::{engine::general_purpose::STANDARD, Engine as _};
+                                let bytes = unsafe {
+                                    std::slice::from_raw_parts(
+                                        vec_embedding.as_ptr() as *const u8,
+                                        vec_embedding.len() * 4,
+                                    )
+                                };
+                                EmbeddingOutput::Base64(STANDARD.encode(bytes))
+                            }
+                        };
+
+                        if let Some(sender) = &group.sender {
+                            let response = EmbeddingResponse {
+                                object: "list",
+                                data: vec![EmbeddingData {
+                                    object: "embedding",
+                                    embedding: output,
+                                    index: 0,
+                                }],
+                                model: model_name.clone(),
+                                usage: EmbeddingUsage {
+                                    prompt_tokens: prompt_len,
+                                    total_tokens: prompt_len,
+                                },
+                            };
+                            let _ = sender.send(ChatResponse::Embedding(response));
+                        } else {
+                            tracing::error!("No sender for embedding group!");
+                        }
+                        seq.deref_mut().set_finish_reason("stop".to_string());
+                        start_idx = end_idx;
+                    }
+
+                    e.scheduler.free_finished_sequence_groups();
+                }
+                continue;
+            }
 
             if is_prompt {
                 let mut e = engine.write();
@@ -639,9 +748,9 @@ impl LLMEngine {
                             let prompt_finish_time = SystemTime::now();
                             prompt_finish_times.insert(*group.get_id(), prompt_finish_time);
 
-                            #[cfg(feature = "nccl")]
+                            #[cfg(feature = "eccl")]
                             let do_log = DaemonManager::is_master_rank();
-                            #[cfg(not(feature = "nccl"))]
+                            #[cfg(not(feature = "eccl"))]
                             let do_log = true;
                             if do_log {
                                 let prompt_time_costs = prompt_finish_time
@@ -663,45 +772,175 @@ impl LLMEngine {
                         if let Some(sender) = &group.sender {
                             let e = engine.read();
                             let (pipeline, _) = e.get_pipeline(rank).unwrap();
-                            let chunk = e.get_stream_response(
-                                group.request_id.clone(),
-                                group.arrival_time,
-                                Some(logprobs.bytes.clone()),
-                                None,
-                                pipeline,
-                            );
-                            let ret = sender.send(ChatResponse::Chunk(chunk));
-                            if ret.is_err() {
-                                warn!(
-                                    "Send stream response error! (sequence id {})",
-                                    seq.deref().get_id()
-                                );
-                                seq.deref_mut().set_finish_reason("abort".to_string());
+                            let token_str = &logprobs.bytes;
+
+                            let should_parse_tools = group.sampling_params.mcp_mode.is_some();
+                            let mut content_to_send: Option<String> = None;
+                            {
+                                let outer = seq.deref();
+                                let mut data = outer.deref_mut();
+
+                                if should_parse_tools {
+                                    if data.stream_tool_parser.is_none() {
+                                        data.stream_tool_parser =
+                                            Some(StreamToolParser::new_with_config(
+                                                &pipeline.tool_model_type,
+                                                pipeline.tool_config.clone(),
+                                            ));
+                                    }
+                                    if let Some(parser) = data.stream_tool_parser.as_mut() {
+                                        match parser.process_token(logprobs.token, token_str) {
+                                            StreamResult::Content(text) => {
+                                                if !text.is_empty() {
+                                                    content_to_send = Some(text);
+                                                }
+                                            }
+                                            StreamResult::Buffering => {}
+                                            StreamResult::FlushBuffer(text) => {
+                                                if !text.is_empty() {
+                                                    content_to_send = Some(text);
+                                                }
+                                            }
+                                            StreamResult::ToolCalls(calls) => {
+                                                data.pending_tool_calls.extend(calls);
+                                            }
+                                        }
+                                    }
+                                } else if !token_str.is_empty() {
+                                    content_to_send = Some(token_str.clone());
+                                }
                             }
-                            if seq.deref_mut().get_len() % 1000 == 0 {
-                                e.scheduler.print_free_blocks();
+
+                            if let Some(content) = content_to_send {
+                                let chunk = e.get_stream_response(
+                                    group.request_id.clone(),
+                                    group.arrival_time,
+                                    Some(content),
+                                    None,
+                                    None,
+                                    pipeline,
+                                );
+                                let ret = sender.send(ChatResponse::Chunk(chunk));
+                                if ret.is_err() {
+                                    warn!(
+                                        "Send stream response error! (sequence id {})",
+                                        seq.deref().get_id()
+                                    );
+                                    seq.deref_mut().set_finish_reason("abort".to_string());
+                                }
+                                if seq.deref_mut().get_len() % 1000 == 0 {
+                                    e.scheduler.print_free_blocks();
+                                }
                             }
                         };
                         seq.deref_mut().add_token(logprobs);
                     }
                     Either::Right(finish_reason) => {
                         let seq = group.get_seqs().values().nth(0).unwrap();
+
+                        let mut final_tool_calls = None;
+                        let mut final_content = None;
+                        {
+                            let outer = seq.deref();
+                            let mut data = outer.deref_mut();
+                            let should_parse_tools = group.sampling_params.mcp_mode.is_some();
+
+                            if should_parse_tools {
+                                if let Some(parser) = data.stream_tool_parser.as_mut() {
+                                    match parser.state() {
+                                        ParserState::Buffering => {
+                                            if let Some(mut parsed) = parser.finalize() {
+                                                data.pending_tool_calls.append(&mut parsed);
+                                            } else {
+                                                let buffer = parser.take_buffer();
+                                                if !buffer.is_empty() {
+                                                    final_content = Some(buffer);
+                                                }
+                                            }
+                                        }
+                                        ParserState::MaybeStart => {
+                                            let buffer = parser.take_buffer();
+                                            if !buffer.is_empty() {
+                                                final_content = Some(buffer);
+                                            }
+                                        }
+                                        ParserState::Normal => {}
+                                    }
+                                }
+                            }
+
+                            let pending = std::mem::take(&mut data.pending_tool_calls);
+                            if !pending.is_empty() {
+                                final_tool_calls = Some(pending);
+                            }
+                        }
+
                         if let Some(sender) = &group.sender {
                             let e = engine.read();
                             let (pipeline, _) = e.get_pipeline(rank).unwrap();
-                            let chunk = e.get_stream_response(
-                                group.request_id.clone(),
-                                group.arrival_time,
-                                None,
-                                Some(finish_reason.clone()),
-                                pipeline,
-                            );
-                            let ret = sender.send(ChatResponse::Chunk(chunk));
-                            if ret.is_err() {
-                                warn!("Send stream finish response error!");
+
+                            if let Some(tool_calls) = final_tool_calls {
+                                let tool_calls = tool_calls
+                                    .into_iter()
+                                    .enumerate()
+                                    .map(|(idx, call)| call.with_index(idx))
+                                    .collect::<Vec<_>>();
+                                let mut choices = Vec::new();
+                                let choice = Choice {
+                                    delta: ChoiceData {
+                                        role: "assistant".to_string(),
+                                        content: None,
+                                        tool_calls: Some(tool_calls),
+                                    },
+                                    // If we found a tool call at finish, the reason is likely tool_calls
+                                    finish_reason: Some("tool_calls".to_string()),
+                                    index: 0,
+                                };
+                                choices.push(choice);
+
+                                let chunk = ChatCompletionChunk {
+                                    id: group.request_id.clone(),
+                                    choices,
+                                    created: get_created_time_secs(),
+                                    model: pipeline.name().to_string(),
+                                    object: "chat.completion.chunk",
+                                    system_fingerprint: None,
+                                };
+
+                                tracing::info!("Sending final tool call chunk: {:?}", chunk);
+                                let ret = sender.send(ChatResponse::Chunk(chunk));
+                                if ret.is_err() {
+                                    warn!(
+                                        "Send stream response error! (sequence id {})",
+                                        seq.deref().get_id()
+                                    );
+                                    seq.deref_mut().set_finish_reason("abort".to_string());
+                                }
+                            } else {
+                                let finish_reason = if finish_reason == "tool_calls" {
+                                    "stop".to_string()
+                                } else {
+                                    finish_reason.clone()
+                                };
+                                let chunk = e.get_stream_response(
+                                    group.request_id.clone(),
+                                    group.arrival_time,
+                                    final_content,
+                                    None,
+                                    Some(finish_reason.clone()),
+                                    pipeline,
+                                );
+                                let ret = sender.send(ChatResponse::Chunk(chunk));
+                                if ret.is_err() {
+                                    warn!(
+                                        "Send stream response error! (sequence id {})",
+                                        seq.deref().get_id()
+                                    );
+                                    seq.deref_mut().set_finish_reason("abort".to_string());
+                                }
                             }
                         };
-                        seq.deref_mut().set_finish_reason(finish_reason)
+                        seq.deref_mut().set_finish_reason(finish_reason);
                     }
                 }
             }
@@ -762,18 +1001,84 @@ impl LLMEngine {
                         let e = engine.read();
                         for (index, seq) in top_n.iter().enumerate() {
                             let outputs = seq.deref_mut().get_output_tokens();
-                            let data = outputs
-                                .iter()
-                                .map(|x| x.token.try_into().unwrap())
-                                .collect::<Vec<_>>();
                             let pipeline = e.get_pipeline(0usize).unwrap().0.as_ref();
-                            let data = pipeline.tokenizer().decode(&data, false).unwrap();
+                            let should_parse_tools = group.sampling_params.mcp_mode.is_some();
+                            let mut finish_reason = seq.deref_mut().get_finish_reason().clone();
+
+                            let (content, tool_calls) = if should_parse_tools {
+                                let mut parser = StreamToolParser::new_with_config(
+                                    &pipeline.tool_model_type,
+                                    pipeline.tool_config.clone(),
+                                );
+                                let mut pending_tool_calls = Vec::new();
+                                let mut accumulated = String::new();
+
+                                for output in &outputs {
+                                    match parser.process_token(output.token, &output.bytes) {
+                                        StreamResult::Content(text) => {
+                                            accumulated.push_str(&text);
+                                        }
+                                        StreamResult::FlushBuffer(text) => {
+                                            accumulated.push_str(&text);
+                                        }
+                                        StreamResult::Buffering => {}
+                                        StreamResult::ToolCalls(mut calls) => {
+                                            pending_tool_calls.append(&mut calls);
+                                        }
+                                    }
+                                }
+
+                                match parser.state() {
+                                    ParserState::Buffering => {
+                                        if let Some(mut parsed) = parser.finalize() {
+                                            pending_tool_calls.append(&mut parsed);
+                                        } else {
+                                            let buffer = parser.take_buffer();
+                                            if !buffer.is_empty() {
+                                                accumulated.push_str(&buffer);
+                                            }
+                                        }
+                                    }
+                                    ParserState::MaybeStart => {
+                                        let buffer = parser.take_buffer();
+                                        if !buffer.is_empty() {
+                                            accumulated.push_str(&buffer);
+                                        }
+                                    }
+                                    ParserState::Normal => {}
+                                }
+
+                                if pending_tool_calls.is_empty() {
+                                    let content = if accumulated.is_empty() {
+                                        None
+                                    } else {
+                                        Some(accumulated)
+                                    };
+                                    (content, None)
+                                } else {
+                                    finish_reason = "tool_calls".to_string();
+                                    (None, Some(pending_tool_calls))
+                                }
+                            } else {
+                                let data = outputs
+                                    .iter()
+                                    .map(|x| x.token.try_into().unwrap())
+                                    .collect::<Vec<_>>();
+                                let data = pipeline.tokenizer().decode(&data, false).unwrap();
+                                (Some(data), None)
+                            };
+
+                            if tool_calls.is_none() && finish_reason == "tool_calls" {
+                                finish_reason = "stop".to_string();
+                            }
+
                             let choice = ChatChoice {
                                 message: ChatChoiceData {
-                                    role: pipeline.get_past_conversation().get_roles().0.clone(),
-                                    content: Some(data),
+                                    role: "assistant".to_string(),
+                                    content,
+                                    tool_calls,
                                 },
-                                finish_reason: Some(seq.deref_mut().get_finish_reason().clone()),
+                                finish_reason: Some(finish_reason),
                                 index,
                                 logprobs: if group.use_logprobs {
                                     Some(WrapperLogprobs { content: outputs })
@@ -985,7 +1290,9 @@ impl LLMEngine {
                 context_lens.push(seq_len as u32);
 
                 let seqlen_q = num_tokens;
-                let seqlen_k = if num_cached_tokens > 0 && cfg!(feature = "flash-decoding") {
+                let use_cached_kv = num_cached_tokens > 0
+                    && (cfg!(feature = "flash-decoding") || self.scheduler.prefix_cache_enabled());
+                let seqlen_k = if use_cached_kv {
                     num_cached_tokens + num_tokens
                 } else {
                     num_tokens
@@ -1100,6 +1407,7 @@ impl LLMEngine {
             max_seqlen_q,
             max_seqlen_k,
             max_context_len,
+            disable_flash_attn: None,
         };
 
         Ok(PreparedInputs {
@@ -1198,6 +1506,7 @@ impl LLMEngine {
             max_seqlen_q: 0,
             max_seqlen_k: 0,
             max_context_len: max_context_len as usize,
+            disable_flash_attn: None,
         };
 
         Ok(PreparedInputs {
@@ -1216,6 +1525,9 @@ impl LLMEngine {
         created: SystemTime,
         sampling_params: &SamplingParams,
         use_logprobs: bool,
+        is_embedding: bool,
+        encoding_format: crate::openai::requests::EncodingFormat,
+        embedding_type: crate::openai::requests::EmbeddingType,
         sender: Option<Sender<ChatResponse>>,
     ) -> SequenceGroup {
         let seq = Arc::new(Sequence(std::sync::RwLock::new(_Sequence::new(
@@ -1231,6 +1543,9 @@ impl LLMEngine {
             created,
             sampling_params.clone(),
             use_logprobs,
+            is_embedding,
+            encoding_format,
+            embedding_type,
             sender,
         )
     }
@@ -1242,6 +1557,9 @@ impl LLMEngine {
         created: SystemTime,
         sampling_params: SamplingParams,
         use_logprobs: bool,
+        is_embedding: bool,
+        encoding_format: crate::openai::requests::EncodingFormat,
+        embedding_type: crate::openai::requests::EmbeddingType,
         sender: Option<Arc<Sender<ChatResponse>>>,
         sync_notify: Option<Arc<Notify>>,
     ) {
@@ -1276,6 +1594,9 @@ impl LLMEngine {
             created,
             sampling_params,
             use_logprobs,
+            is_embedding,
+            encoding_format,
+            embedding_type,
         };
         let mut waiting_tasks = self.waiting_tasks.write();
         waiting_tasks.push(task);

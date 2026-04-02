@@ -7,24 +7,22 @@ use crate::openai::logits_processor::LogitsProcessor;
 use crate::openai::models::TokenID;
 use crate::openai::requests::StopTokens;
 use crate::openai::sampling_params::{GenerationConfig, Logprobs, TopLogprob};
+use crate::openai::{BosEosToken, TokenizerConfig};
+use crate::scheduler::sequence::SequenceGroup;
+use crate::tools::stream_parser::{ToolConfig, ToolModelType};
 use crate::openai::{
-    conversation::{
-        default_conversation::{
-            DefaultConversation, DefaultConversationSeparators, SeparatorStyle,
-        },
-        Conversation,
+    conversation::default_conversation::{
+        DefaultConversation, DefaultConversationSeparators, SeparatorStyle,
     },
     models::{
         deepseek::DeepSeek, gemma::Gemma, gemma3::Gemma3, glm4::GLM4, llama::Llama,
-        mistral::Mistral, phi2::Phi2, phi3::Phi, quantized_glm4::GGUFGLM4,
+        mistral::Mistral, phi2::Phi2, phi4::Phi4ForCausalLM as Phi4, quantized_glm4::GGUFGLM4,
         quantized_llama::GGUFLLaMa, quantized_phi3::GGUFPhi3, quantized_qwen::GGUFQWen,
         quantized_qwen3_moe::GGUFQWenMoE, qwen::Qwen, qwen3_moe::Qwen3MoE, stable_lm::StableLM,
         yi::Yi, Config,
     },
     PipelineConfig,
 };
-use crate::openai::{BosEosToken, TokenizerConfig};
-use crate::scheduler::sequence::SequenceGroup;
 use attention_rs::InputMetadata;
 use candle_core::quantized::gguf_file;
 use candle_core::{DType, Device, Result, Tensor};
@@ -33,6 +31,7 @@ use either::Either::{Left, Right};
 use hf_hub::{api::sync::ApiBuilder, Repo, RepoType};
 use parking_lot::RwLock;
 use rayon::prelude::*;
+use regex::Regex;
 use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::path::Path;
@@ -48,7 +47,7 @@ const MAX_GEN_TOKENS: usize = 16 * 1024;
 pub enum LLMModel {
     Llama(Arc<Llama>),
     Phi2(Arc<Phi2>),
-    Phi3(Arc<Phi>),
+    Phi4(Arc<Phi4>),
     Qwen(Arc<Qwen>),
     Qwen3MoE(Arc<Qwen3MoE>),
     Gemma(Arc<Gemma>),
@@ -65,18 +64,40 @@ pub enum LLMModel {
     GLM4GGUF(Arc<GGUFGLM4>),
 }
 
+fn tool_model_type_for(model: &LLMModel) -> ToolModelType {
+    match model {
+        LLMModel::Llama(_) | LLMModel::LlamaGGUF(_) => ToolModelType::LLaMa,
+        LLMModel::Qwen(_) | LLMModel::QWenGGUF(_) => ToolModelType::Qwen,
+        LLMModel::Qwen3MoE(_) | LLMModel::QWenGGUFMoE(_) => ToolModelType::Qwen3MoE,
+        LLMModel::Gemma(_) => ToolModelType::Gemma,
+        LLMModel::Gemma3(_) => ToolModelType::Gemma3,
+        LLMModel::Mistral(_) => ToolModelType::Mistral,
+        LLMModel::Yi(_) => ToolModelType::Yi,
+        LLMModel::StableLM(_) => ToolModelType::StableLM,
+        LLMModel::GLM4(_) | LLMModel::GLM4GGUF(_) => ToolModelType::GLM4,
+        LLMModel::DeepSeek(_) => ToolModelType::DeepSeek,
+        LLMModel::Phi2(_) | LLMModel::Phi3GGUF(_) => ToolModelType::Phi,
+        LLMModel::Phi4(_) => ToolModelType::Phi4,
+    }
+}
+
 /// top-p, multinomial, and argmax sampling are implemented. Beam search is not implemented.
 pub struct DefaultPipeline {
-    model: LLMModel,
-    tokenizer: Tokenizer,
-    logits_processor: LogitsProcessor,
-    conversation: DefaultConversation,
-    name: String,
-    dtype: DType,
-    device: Device,
-    stop_token_ids: Vec<u32>,
-    rank: usize,
+    pub model: LLMModel,
+    pub tokenizer: Tokenizer,
+    pub logits_processor: LogitsProcessor,
+    pub conversation: DefaultConversation,
+    pub name: String,
+    pub dtype: DType,
+    pub device: Device,
+    pub stop_token_ids: Vec<u32>,
+    pub rank: usize,
     pub stream_decoders: RwLock<super::StreamDecoderMap>,
+    pub tool_call_end_token_ids: Vec<u32>,
+    pub json_end_token_id: Option<u32>,
+    pub tool_call_regex: Regex,
+    pub tool_config: ToolConfig,
+    pub tool_model_type: ToolModelType,
     #[cfg(all(feature = "gcu", feature = "graph"))]
     pub capturer: GraphCapturer<CudaGraphWrapper<CudaGraphFn>>,
 }
@@ -503,8 +524,8 @@ impl DefaultLoader {
 
             let mut config = match arch.as_str() {
                 "LlamaForCausalLM" => Llama::load_config(&cfile, isq)?,
-                "PhiForCausalLM" => Phi2::load_config(&cfile, isq)?,
-                "Phi3ForCausalLM" => Phi::load_config(&cfile, isq)?,
+                "PhiForCausalLM" | "Phi2ForCausalLM" => Phi2::load_config(&cfile, isq)?,
+                "Phi3ForCausalLM" | "Phi4ForCausalLM" => Phi4::load_config(&cfile, isq)?,
                 "Qwen2ForCausalLM" | "Qwen3ForCausalLM" => Qwen::load_config(&cfile, isq)?,
                 "Qwen2MoeForCausalLM" | "Qwen3MoeForCausalLM" => {
                     Qwen3MoE::load_config(&cfile, isq)?
@@ -619,16 +640,16 @@ impl DefaultLoader {
                             )),
                             SeparatorStyle::Llama3,
                         ),
-                        "PhiForCausalLM" => (
+                        "PhiForCausalLM" | "Ph2ForCausalLM" => (
                             LLMModel::Phi2(Arc::new(
                                 Phi2::new(vb, &config, dtype, &device, comm, Arc::clone(&reporter))
                                     .unwrap(),
                             )),
                             SeparatorStyle::Phi,
                         ),
-                        "Phi3ForCausalLM" => (
-                            LLMModel::Phi3(Arc::new(
-                                Phi::new(vb, &config, dtype, &device, comm, Arc::clone(&reporter))
+                        "Phi3ForCausalLM" | "Phi4ForCausalLM" => (
+                            LLMModel::Phi4(Arc::new(
+                                Phi4::new(vb, &config, dtype, &device, comm, Arc::clone(&reporter))
                                     .unwrap(),
                             )),
                             SeparatorStyle::Phi,
@@ -765,11 +786,6 @@ impl DefaultLoader {
             (models, devices, config, sep_style[0].clone())
         };
 
-        info!(
-            "Using FP8 KV Cache? {}, cache dtype {:?}",
-            kv_cache_dtype == DType::U8,
-            kv_cache_dtype
-        );
         warn!("Done loading.");
 
         //max and min number of tokens generated per request
@@ -967,6 +983,14 @@ impl DefaultLoader {
                         &devices[rank],
                         stop_token_ids,
                         rank,
+                        if gguf {
+                            match crate::backend::gguf::get_gguf_name(&paths.get_weight_filenames()[0]) {
+                                Ok(name) => name,
+                                _ => None,
+                            }
+                        } else {
+                            None
+                        },
                         #[cfg(all(feature = "gcu", feature = "graph"))]
                         block_size,
                         #[cfg(all(feature = "gcu", feature = "graph"))]
@@ -991,6 +1015,7 @@ impl DefaultPipeline {
         device: &Device,
         stop_token_ids: Vec<u32>,
         rank: usize,
+        model_name: Option<String>,
         #[cfg(all(feature = "gcu", feature = "graph"))] block_size: usize,
         #[cfg(all(feature = "gcu", feature = "graph"))] max_num_seqs: usize,
     ) -> Result<Self> {
@@ -1000,7 +1025,7 @@ impl DefaultPipeline {
             device,
             Llama,
             Phi2,
-            Phi3,
+            Phi4,
             Qwen,
             Qwen3MoE,
             Gemma,
@@ -1016,17 +1041,37 @@ impl DefaultPipeline {
             QWenGGUFMoE,
             GLM4GGUF,
         );
+
+        let tool_model_type = tool_model_type_for(&model);
+        let mut tool_config = ToolConfig::for_model_type(&tool_model_type);
+        tool_config.validate_with_tokenizer(&tokenizer, &tool_model_type);
+        let tool_call_end_token_ids = tool_config.tool_call_end_ids(&tokenizer);
+        let json_end_token_id = tokenizer
+            .encode("}", false)
+            .ok()
+            .and_then(|tokens| tokens.get_ids().last().copied());
+        let tool_call_regex =
+            Regex::new(r#"(?s)\{\s*"name"\s*:.*"arguments"\s*:.*\}\s*$"#).unwrap();
         Ok(Self {
             model,
             tokenizer,
             logits_processor,
             conversation,
-            name: config.architectures.as_ref().unwrap()[0].clone(),
+            name: if let Some(name) = model_name {
+                name
+            } else {
+                config.architectures.as_ref().unwrap()[0].clone()
+            },
             dtype,
             device: device.clone(),
             stop_token_ids,
             rank,
             stream_decoders: RwLock::new(HashMap::new()),
+            tool_call_end_token_ids,
+            json_end_token_id,
+            tool_call_regex,
+            tool_config,
+            tool_model_type,
             #[cfg(all(feature = "gcu", feature = "graph"))]
             capturer: GraphCapturer::new(
                 wrapper,
@@ -1059,7 +1104,7 @@ impl DefaultPipeline {
             LLMModel::Phi2(phi) => {
                 phi.forward(&input_tokens, input_positions, kv_cache, input_metadata)
             }
-            LLMModel::Phi3(phi) => {
+            LLMModel::Phi4(phi) => {
                 phi.forward(&input_tokens, input_positions, kv_cache, input_metadata)
             }
             LLMModel::Qwen(qwen) => {
@@ -1104,6 +1149,60 @@ impl DefaultPipeline {
             LLMModel::GLM4GGUF(glm4) => {
                 glm4.forward(&input_tokens, input_positions, kv_cache, input_metadata)
             }
+        }
+    }
+
+    pub fn forward_embedding(
+        &self,
+        input_tokens: Tensor,
+        input_positions: &Tensor,
+        kv_cache: Option<&Vec<(Tensor, Tensor)>>,
+        input_metadata: &InputMetadata,
+    ) -> Result<Tensor> {
+        match &self.model {
+            LLMModel::Llama(llama) => {
+                llama.forward_embedding(&input_tokens, input_positions, kv_cache, input_metadata)
+            }
+            LLMModel::Mistral(mistral) => {
+                mistral.forward_embedding(&input_tokens, input_positions, kv_cache, input_metadata)
+            }
+            LLMModel::Phi4(phi) => {
+                phi.forward_embedding(&input_tokens, input_positions, kv_cache, input_metadata)
+            }
+            LLMModel::Gemma(gemma) => {
+                gemma.forward_embedding(&input_tokens, input_positions, kv_cache, input_metadata)
+            }
+            LLMModel::Gemma3(gemma3) => {
+                gemma3.forward_embedding(&input_tokens, input_positions, kv_cache, input_metadata)
+            }
+            LLMModel::Qwen(qwen) => {
+                qwen.forward_embedding(&input_tokens, input_positions, kv_cache, input_metadata)
+            }
+            LLMModel::Qwen3MoE(qwen3_moe) => qwen3_moe.forward_embedding(
+                &input_tokens,
+                input_positions,
+                kv_cache,
+                input_metadata,
+            ),
+            LLMModel::LlamaGGUF(llama) => {
+                llama.forward_embedding(&input_tokens, input_positions, kv_cache, input_metadata)
+            }
+            LLMModel::Phi3GGUF(phi3) => {
+                phi3.forward_embedding(&input_tokens, input_positions, kv_cache, input_metadata)
+            }
+            LLMModel::QWenGGUF(qwen) => {
+                qwen.forward_embedding(&input_tokens, input_positions, kv_cache, input_metadata)
+            }
+            LLMModel::QWenGGUFMoE(qwen_moe) => {
+                qwen_moe.forward_embedding(&input_tokens, input_positions, kv_cache, input_metadata)
+            }
+            LLMModel::GLM4GGUF(glm4) => {
+                glm4.forward_embedding(&input_tokens, input_positions, kv_cache, input_metadata)
+            }
+            LLMModel::Yi(yi) => {
+                yi.forward_embedding(&input_tokens, input_positions, kv_cache, input_metadata)
+            }
+            _ => candle_core::bail!("Model not supported for embedding!"),
         }
     }
 
@@ -1210,6 +1309,9 @@ impl DefaultPipeline {
             .enumerate()
             .map(|(i, next_token)| {
                 let group_id = group_ids[i];
+                let group = groups
+                    .get(i)
+                    .expect("group index out of range for sampling");
                 let mut text = "".to_string();
                 let mut decoder_map = self.stream_decoders.write();
                 match decoder_map.get_mut(&group_id) {
@@ -1238,6 +1340,27 @@ impl DefaultPipeline {
                 let custom_stop_token_match = !custom_stop_tokens[i].is_empty()
                     && custom_stop_tokens[i].contains(&text.trim().to_string());
 
+                if group.sampling_params.mcp_mode.is_some() {
+                    if self.tool_call_end_token_ids.contains(&next_token) {
+                        return Right("tool_calls".to_string());
+                    }
+                    if self.json_end_token_id == Some(next_token) {
+                        let seq = group.get_seqs().values().next().unwrap();
+                        let mut output_tokens: Vec<u32> = seq
+                            .deref()
+                            .get_output_tokens()
+                            .iter()
+                            .map(|logprob| logprob.token)
+                            .collect();
+                        output_tokens.push(next_token);
+                        if let Ok(decoded) = self.tokenizer.decode(&output_tokens, true) {
+                            if self.tool_call_regex.is_match(&decoded) {
+                                return Right("tool_calls".to_string());
+                            }
+                        }
+                    }
+                }
+
                 if tokens_generated[i] < 0 {
                     Right("length".to_string())
                 } else if tokens_generated[i] > 0
@@ -1265,22 +1388,15 @@ impl DefaultPipeline {
         &self.tokenizer
     }
 
-    pub fn get_conversation(&mut self, with_history: bool) -> &mut dyn Conversation {
-        if !with_history {
-            self.conversation.clear_message();
-        }
-        &mut self.conversation
-    }
-
-    pub fn get_past_conversation(&self) -> &dyn Conversation {
-        &self.conversation
+    pub fn get_conversation(&self) -> DefaultConversation {
+        self.conversation.clone()
     }
 
     pub fn get_model_config(&self) -> Config {
         match &self.model {
             LLMModel::Llama(llama) => llama.get_config().clone(),
             LLMModel::Phi2(phi) => phi.get_config().clone(),
-            LLMModel::Phi3(phi) => phi.get_config().clone(),
+            LLMModel::Phi4(phi) => phi.get_config().clone(),
             LLMModel::Qwen(qwen) => qwen.get_config().clone(),
             LLMModel::Qwen3MoE(qwen) => qwen.get_config().clone(),
             LLMModel::Gemma(gemma) => gemma.get_config().clone(),
@@ -1317,7 +1433,11 @@ impl DefaultPipeline {
 
     #[cfg(all(feature = "gcu", feature = "graph"))]
     pub fn warmup_capture(&mut self, kv_caches: Option<&Vec<(Tensor, Tensor)>>) -> Result<()> {
-        self.capturer.capture(&self.device, kv_caches)
+        match &self.model {
+            LLMModel::Phi4(_) => Ok(()),
+            LLMModel::Phi3GGUF(_) => Ok(()),
+            _ => self.capturer.capture(&self.device, kv_caches),
+        }
     }
 }
 

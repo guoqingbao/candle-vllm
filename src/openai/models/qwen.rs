@@ -120,7 +120,14 @@ impl Qwen {
         comm: Rc<Comm>,
         progress_reporter: Arc<RwLock<ProgressReporter>>,
     ) -> Result<Self> {
-        let vb_m = vb.pp("model");
+        let (vb_m, tie_word_embeddings) = if !vb.contains_tensor("model.embed_tokens.weight")
+            && vb.contains_tensor("embed_tokens.weight")
+        {
+            (vb.clone(), true) // in case there is no lm_head in embedding models
+        } else {
+            (vb.pp("model"), cfg.tie_word_embeddings)
+        };
+
         let embed_tokens = embedding(cfg.vocab_size, cfg.hidden_size, vb_m.pp("embed_tokens"))?;
         let rotary_emb = Arc::new(ScalingRotaryEmbedding::new(dtype, cfg, device, true)?);
         let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
@@ -136,7 +143,7 @@ impl Qwen {
         let lm_head = ReplicatedLinear::load_no_bias(
             cfg.hidden_size,
             cfg.vocab_size,
-            if cfg.tie_word_embeddings {
+            if tie_word_embeddings {
                 vb_m.pp("embed_tokens")
             } else {
                 vb.pp("lm_head")
@@ -161,6 +168,27 @@ impl Qwen {
         input_positions: &Tensor,
         kv_caches: Option<&Vec<(Tensor, Tensor)>>,
         input_metadata: &InputMetadata,
+    ) -> Result<Tensor> {
+        self.forward_inner(input_ids, input_positions, kv_caches, input_metadata, false)
+    }
+
+    pub fn forward_embedding(
+        &self,
+        input_ids: &Tensor,
+        input_positions: &Tensor,
+        kv_caches: Option<&Vec<(Tensor, Tensor)>>,
+        input_metadata: &InputMetadata,
+    ) -> Result<Tensor> {
+        self.forward_inner(input_ids, input_positions, kv_caches, input_metadata, true)
+    }
+
+    fn forward_inner(
+        &self,
+        input_ids: &Tensor,
+        input_positions: &Tensor,
+        kv_caches: Option<&Vec<(Tensor, Tensor)>>,
+        input_metadata: &InputMetadata,
+        return_hidden: bool,
     ) -> Result<Tensor> {
         let seqlens = if input_metadata.cu_seqlens_q.is_some() {
             input_metadata
@@ -204,12 +232,16 @@ impl Qwen {
             }
         }
 
-        if !seqlens.is_empty() {
+        if !seqlens.is_empty() && !return_hidden {
             let indices: Vec<_> = seqlens.iter().map(|x| x - 1 as u32).collect();
             let batch = indices.len();
             xs = xs.index_select(&Tensor::from_vec(indices, (batch,), xs.device())?, 0)?;
         }
         let xs = self.norm.forward(&xs)?;
+
+        if return_hidden {
+            return Ok(xs);
+        }
         self.lm_head.forward(&xs)?.to_dtype(DType::F32)
     }
 
