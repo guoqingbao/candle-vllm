@@ -6,6 +6,7 @@ use crate::openai::streaming::ChatResponse;
 use crate::openai::TaskData;
 use crate::scheduler::Scheduler;
 use crate::tools::stream_parser::{ParserState, StreamResult, StreamToolParser};
+#[allow(unused_imports)]
 use crate::{
     openai::{
         models::Config,

@@ -45,7 +45,7 @@ dirs = "5.0.1"
 minijinja = { version = "2.10.2", features = ["builtins", "json"] }
 minijinja-contrib = { version = "2.10.2", features = ["pycompat"] }
 thiserror = "1.0.58"
-attention-rs = { path = "/root/attention.rs", version="0.1.7" }
+attention-rs = { git = "https://github.com/guoqingbao/attention.rs.git", version="0.1.7", rev = "9f48303" }
 metal = { version = "0.27.0", features = ["mps"], optional = true }
 lazy_static = {version = "1.4.0"}
 once_cell = "1.20.2"
@@ -74,13 +74,14 @@ local-ip-address = "0.6.5"
 
 [features]
 accelerate = ["dep:accelerate-src", "candle-core/accelerate", "candle-nn/accelerate"]
-#cuda = ["candle-core/cuda", "candle-nn/cuda", "attention-rs/cuda"]
+cuda = []
 gcu = ["candle-core/gcu", "candle-core/async", "candle-nn/gcu", "attention-rs/gcu"]
-#cutlass = ["cuda", "attention-rs/cutlass"]
+cutlass = []
+nccl = []
 metal = ["candle-core/metal", "candle-nn/metal", "dep:metal", "attention-rs/metal"]
 mkl = ["dep:intel-mkl-src", "candle-core/mkl", "candle-nn/mkl"]
 eccl = ["candle-core/eccl", "candle-nn/eccl"]
 mpi = ["candle-core/eccl", "candle-nn/eccl", "dep:mpi"]
 graph = ["candle-core/graph"]
-flash-decoding = ["attention-rs/gcu", "attention-rs/flash-decoding"]
+flash-decoding = ["attention-rs/gcu", "attention-rs/flash-decoding", "flash-attn"]
 flash-attn = ["attention-rs/gcu", "attention-rs/flash-attn"]
