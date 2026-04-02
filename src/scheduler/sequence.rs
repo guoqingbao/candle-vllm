@@ -4,10 +4,11 @@ use std::{
 };
 
 use super::block_engine::LogicalTokenBlock;
+use crate::openai::multimodal::ImageData;
 use crate::openai::sampling_params::{Logprobs, SamplingParams};
 use crate::openai::streaming::ChatResponse;
 use crate::tools::stream_parser::StreamToolParser;
-use crate::tools::ToolCall;
+use crate::tools::{Tool, ToolCall};
 use flume::Sender;
 use std::time::SystemTime;
 #[derive(Clone, PartialEq)]
@@ -42,10 +43,16 @@ pub struct SequenceData {
     pub in_code_block: bool,
     pub stream_tool_parser: Option<StreamToolParser>,
     pub pending_tool_calls: Vec<ToolCall>,
+    pub pending_finish_logprobs: Option<Logprobs>,
+    pub suppressed_tool_markup: String,
+    pub prompt_replay_consumed: bool,
+    pub stream_role_sent: bool,
+    pub images: Option<ImageData>,
+    pub mamba_prefix_hash: Option<u64>,
 }
 
 impl SequenceData {
-    pub fn new(prompt_token_ids: Vec<u32>) -> Self {
+    pub fn new(prompt_token_ids: Vec<u32>, images: Option<ImageData>) -> Self {
         Self {
             prompt_token_ids,
             output_token_ids: Vec::new(),
@@ -59,6 +66,12 @@ impl SequenceData {
             in_code_block: false,
             stream_tool_parser: None,
             pending_tool_calls: Vec::new(),
+            pending_finish_logprobs: None,
+            suppressed_tool_markup: String::new(),
+            prompt_replay_consumed: false,
+            stream_role_sent: false,
+            images,
+            mamba_prefix_hash: None,
         }
     }
 
@@ -86,9 +99,14 @@ pub struct _Sequence {
 }
 
 impl _Sequence {
-    pub fn new(prompt_token_ids: &Vec<u32>, seq_id: usize, block_size: usize) -> Self {
+    pub fn new(
+        prompt_token_ids: &Vec<u32>,
+        seq_id: usize,
+        block_size: usize,
+        images: Option<ImageData>,
+    ) -> Self {
         let mut this = Self {
-            data: RwLock::new(SequenceData::new(prompt_token_ids.clone())),
+            data: RwLock::new(SequenceData::new(prompt_token_ids.clone(), images)),
             seq_id,
             logical_token_blocks: Vec::new(),
             block_size,
@@ -226,6 +244,22 @@ impl _Sequence {
     pub fn set_num_cached_tokens(&mut self, num_cached_tokens: usize) {
         self.deref_mut().num_cached_tokens = num_cached_tokens;
     }
+
+    pub fn get_images(&self) -> Option<ImageData> {
+        self.deref().images.clone()
+    }
+
+    pub fn set_images(&mut self, images: Option<ImageData>) {
+        self.deref_mut().images = images;
+    }
+
+    pub fn get_mamba_prefix_hash(&self) -> Option<u64> {
+        self.deref().mamba_prefix_hash
+    }
+
+    pub fn set_mamba_prefix_hash(&mut self, hash: Option<u64>) {
+        self.deref_mut().mamba_prefix_hash = hash;
+    }
 }
 
 impl _Sequence {
@@ -280,13 +314,19 @@ pub struct SequenceGroup {
     pub is_embedding: bool,
     pub encoding_format: crate::openai::requests::EncodingFormat,
     pub embedding_type: crate::openai::requests::EmbeddingType,
+    pub tools: Vec<Tool>,
     pub sender: Option<Sender<ChatResponse>>,
+    pub include_usage: bool,
     // Tool call and reasoning tracking
     pub accumulated_output: String,
     pub tool_call_state: ToolCallState,
     pub tool_call_buffer: String,
     pub active_reasoning_end: Option<String>,
     pub in_code_block: bool,
+    /// Token IDs from the generation-prompt suffix (e.g. `<think>\n`) that
+    /// should be replayed through the streaming tool parser before the first
+    /// real decoded token, so the parser sees the reasoning start marker.
+    pub prompt_replay_token_ids: Option<Vec<u32>>,
 }
 
 impl SequenceGroup {
@@ -302,7 +342,9 @@ impl SequenceGroup {
         is_embedding: bool,
         encoding_format: crate::openai::requests::EncodingFormat,
         embedding_type: crate::openai::requests::EmbeddingType,
+        tools: Vec<Tool>,
         sender: Option<Sender<ChatResponse>>,
+        include_usage: bool,
     ) -> Self {
         let mut seq_map = HashMap::new();
         for seq in seqs {
@@ -319,12 +361,15 @@ impl SequenceGroup {
             is_embedding,
             encoding_format,
             embedding_type,
+            tools,
             sender,
+            include_usage,
             accumulated_output: "".to_string(),
             tool_call_state: ToolCallState::Normal,
             tool_call_buffer: String::new(),
             active_reasoning_end: None,
             in_code_block: false,
+            prompt_replay_token_ids: None,
         }
     }
 
@@ -341,7 +386,13 @@ impl SequenceGroup {
     }
 
     pub fn get_status(&self) -> SequenceStatus {
-        self.seqs.values().nth(0).unwrap().deref().get_status()
+        self.seqs
+            .iter()
+            .min_by_key(|(seq_id, _)| *seq_id)
+            .expect("sequence group must contain at least one sequence")
+            .1
+            .deref()
+            .get_status()
     }
 
     /// Blocks to add one new token to each sequence
@@ -353,7 +404,13 @@ impl SequenceGroup {
     }
 
     pub fn get_prompt_len(&self) -> usize {
-        self.seqs.len()
+        self.seqs
+            .iter()
+            .min_by_key(|(seq_id, _)| *seq_id)
+            .expect("sequence group must contain at least one sequence")
+            .1
+            .deref()
+            .get_prompt_len()
     }
 
     pub fn get_total_logical_token_blocks(&self) -> usize {

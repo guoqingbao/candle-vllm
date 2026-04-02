@@ -1,14 +1,35 @@
 use crate::openai::models::{Config, ScalingValue};
-use candle::{DType, Device, Result, Tensor};
+#[cfg(not(feature = "gcu"))]
+use attention_rs::fused_rope::FusedRope;
+use candle::{DType, Device, Result, Tensor, D};
 use candle_core as candle;
 pub use std::rc::Rc;
 #[derive(Debug, Clone)]
 pub struct DefaultRotaryEmbedding {
     pub cos: Tensor,
     pub sin: Tensor,
+    #[cfg(feature = "gcu")]
     pub cos_sin: Tensor,
     pub is_gpt_neox: bool,
     pub rotary_dim: Option<usize>,
+}
+
+fn default_rotary_embedding_from_cos_sin(
+    cos: Tensor,
+    sin: Tensor,
+    is_gpt_neox: bool,
+    rotary_dim: Option<usize>,
+) -> Result<DefaultRotaryEmbedding> {
+    #[cfg(feature = "gcu")]
+    let cos_sin = Tensor::cat(&[&cos, &sin], candle::D::Minus1)?;
+    Ok(DefaultRotaryEmbedding {
+        cos,
+        sin,
+        #[cfg(feature = "gcu")]
+        cos_sin,
+        is_gpt_neox,
+        rotary_dim,
+    })
 }
 
 fn calculate_default_inv_freq(base: f64, dim: usize) -> Vec<f32> {
@@ -33,20 +54,22 @@ impl DefaultRotaryEmbedding {
             .to_dtype(DType::F32)?
             .reshape((cfg.max_seq_len, 1))?
             .matmul(&theta.reshape((1, theta.elem_count()))?)?;
-        let cos = idx_theta.cos()?.to_dtype(dtype)?;
-        let sin = idx_theta.sin()?.to_dtype(dtype)?;
-        let cos_sin = Tensor::cat(&[&cos, &sin], candle::D::Minus1)?; //must be contiguous tensor;
-        Ok(Self {
+        #[cfg(feature = "gcu")]
+        let rope_elem_dtype = DType::F32;
+        #[cfg(not(feature = "gcu"))]
+        let rope_elem_dtype = dtype;
+        let cos = idx_theta.cos()?.to_dtype(rope_elem_dtype)?;
+        let sin = idx_theta.sin()?.to_dtype(rope_elem_dtype)?;
+        default_rotary_embedding_from_cos_sin(
             cos,
             sin,
-            cos_sin,
             is_gpt_neox,
-            rotary_dim: if cfg.partial_rotary_factor.is_some() {
+            if cfg.partial_rotary_factor.is_some() {
                 Some(rotary_dim)
             } else {
                 None
             },
-        })
+        )
     }
 }
 
@@ -59,8 +82,8 @@ impl DefaultRotaryEmbedding {
         positions: &Tensor,
     ) -> Result<(Tensor, Tensor)> {
         candle_nn::apply_rotary_emb_qkv(
-            &q,
-            &k,
+            q,
+            k,
             &self.cos_sin,
             &self.sin,
             positions,
@@ -77,7 +100,20 @@ impl DefaultRotaryEmbedding {
         k: &Tensor,
         positions: &Tensor,
     ) -> Result<(Tensor, Tensor)> {
-        use candle::D;
+        if !q.device().is_cpu() && q.dims().len() == 3 && k.dims().len() == 3 {
+            let q = q.contiguous()?;
+            let k = k.contiguous()?;
+            let is_rope_i = !self.is_gpt_neox;
+            if let Some(rotary_dim) = self.rotary_dim {
+                FusedRope::apply_inplace_partial(
+                    &q, &k, &self.cos, &self.sin, positions, is_rope_i, rotary_dim,
+                )?;
+            } else {
+                FusedRope::apply_inplace(&q, &k, &self.cos, &self.sin, positions, is_rope_i)?;
+            }
+            return Ok((q, k));
+        }
+
         let cos = self.cos.index_select(positions, 0)?;
         let sin = self.sin.index_select(positions, 0)?;
         let func = if self.is_gpt_neox {
@@ -92,14 +128,14 @@ impl DefaultRotaryEmbedding {
                 .narrow(D::Minus1, rotary_dim, q.dim(D::Minus1)? - rotary_dim)?
                 .contiguous()?;
             let q_rot = func(&q_rot, &cos, &sin)?;
-            let q_embed = Tensor::cat(&[&q_rot, &q_pass], D::Minus1)?;
+            let q_embed = Tensor::cat(&[&q_rot, &q_pass], D::Minus1)?.contiguous()?;
 
             let k_rot = k.narrow(D::Minus1, 0, rotary_dim)?.contiguous()?;
             let k_pass = k
                 .narrow(D::Minus1, rotary_dim, k.dim(D::Minus1)? - rotary_dim)?
                 .contiguous()?;
             let k_rot = func(&k_rot, &cos, &sin)?;
-            let k_embed = Tensor::cat(&[&k_rot, &k_pass], D::Minus1)?;
+            let k_embed = Tensor::cat(&[&k_rot, &k_pass], D::Minus1)?.contiguous()?;
             (q_embed, k_embed)
         } else {
             let q_embed = func(&q, &cos, &sin)?;
@@ -122,6 +158,10 @@ impl ScalingRotaryEmbedding {
             .partial_rotary_factor
             .map(|factor| (factor * dim as f32) as usize)
             .unwrap_or(dim);
+        #[cfg(feature = "gcu")]
+        let rope_elem_dtype = DType::F32;
+        #[cfg(not(feature = "gcu"))]
+        let rope_elem_dtype = dtype;
         if let Some(rope_scaling) = &cfg.rope_scaling {
             let mut rope_scaling = rope_scaling.clone();
             if !rope_scaling.contains_key("rope_type") && rope_scaling.contains_key("type") {
@@ -140,9 +180,7 @@ impl ScalingRotaryEmbedding {
                     //for missing original_max_position_embeddings, we assume the original was max_position_embeddings / factor
                     *cfg.max_position_embeddings.as_ref().unwrap() as f64 / *factor
                 } else {
-                    candle_core::bail!(
-                        "original_max_position_embeddings must be set in rope_scaling or cfg"
-                    );
+                    cfg.max_position_embeddings.unwrap_or(cfg.max_seq_len) as f64
                 };
 
             if let Some(ScalingValue::String(rope_type)) = rope_scaling.get("rope_type") {
@@ -162,20 +200,18 @@ impl ScalingRotaryEmbedding {
                             1,
                         ))? / (*factor as f64))?
                             .matmul(&inv_freq.reshape((1, inv_freq.elem_count()))?)?;
-                        let cos = idx_theta.cos()?.to_dtype(dtype)?;
-                        let sin = idx_theta.sin()?.to_dtype(dtype)?;
-                        let cos_sin = Tensor::cat(&[&cos, &sin], candle::D::Minus1)?; //must be contiguous tensor;
-                        Self(DefaultRotaryEmbedding {
-                            sin,
+                        let cos = idx_theta.cos()?.to_dtype(rope_elem_dtype)?;
+                        let sin = idx_theta.sin()?.to_dtype(rope_elem_dtype)?;
+                        Self(default_rotary_embedding_from_cos_sin(
                             cos,
-                            cos_sin,
+                            sin,
                             is_gpt_neox,
-                            rotary_dim: if cfg.partial_rotary_factor.is_some() {
+                            if cfg.partial_rotary_factor.is_some() {
                                 Some(rotary_dim)
                             } else {
                                 None
                             },
-                        })
+                        )?)
                     } else {
                         candle_core::bail!("Linear rope_type requires factor to be set");
                     }
@@ -218,27 +254,25 @@ impl ScalingRotaryEmbedding {
                                 .to_dtype(DType::F32)?
                                 .reshape((cfg.max_seq_len, 1))?;
                             let freqs = t.matmul(&inv_freq)?;
-                            let sin = freqs.sin()?.to_dtype(dtype)?;
-                            let cos = freqs.cos()?.to_dtype(dtype)?;
-                            let cos_sin = Tensor::cat(&[&cos, &sin], candle::D::Minus1)?; //must be contiguous tensor;
-                            Self(DefaultRotaryEmbedding {
-                                sin,
+                            let sin = freqs.sin()?.to_dtype(rope_elem_dtype)?;
+                            let cos = freqs.cos()?.to_dtype(rope_elem_dtype)?;
+                            Self(default_rotary_embedding_from_cos_sin(
                                 cos,
-                                cos_sin,
+                                sin,
                                 is_gpt_neox,
-                                rotary_dim: if cfg.partial_rotary_factor.is_some() {
+                                if cfg.partial_rotary_factor.is_some() {
                                     Some(rotary_dim)
                                 } else {
                                     None
                                 },
-                            })
+                            )?)
                         }
                         _ => {
                             candle_core::bail!("Llama3 rope_type requires factor, low_freq_factor, high_freq_factor to be set");
                         }
                     }
                 } else if rope_type == "default" {
-                    Self(DefaultRotaryEmbedding::new(dtype, cfg, dev, is_gpt_neox)?)
+                    Self(DefaultRotaryEmbedding::new(rope_elem_dtype, cfg, dev, is_gpt_neox)?)
                 } else if rope_type == "dynamic" {
                     let scaling_factor = if let Some(ScalingValue::Single(factor)) =
                         rope_scaling.get("alpha")
@@ -279,20 +313,18 @@ impl ScalingRotaryEmbedding {
                         .to_dtype(DType::F32)?
                         .reshape((max_seq_len as usize, 1))?;
                     let freqs = t.matmul(&inv_freq)?;
-                    let sin = freqs.sin()?.to_dtype(dtype)?;
-                    let cos = freqs.cos()?.to_dtype(dtype)?;
-                    let cos_sin = Tensor::cat(&[&cos, &sin], candle::D::Minus1)?; //must be contiguous tensor;
-                    Self(DefaultRotaryEmbedding {
-                        sin,
+                    let sin = freqs.sin()?.to_dtype(rope_elem_dtype)?;
+                    let cos = freqs.cos()?.to_dtype(rope_elem_dtype)?;
+                    Self(default_rotary_embedding_from_cos_sin(
                         cos,
-                        cos_sin,
+                        sin,
                         is_gpt_neox,
-                        rotary_dim: if cfg.partial_rotary_factor.is_some() {
+                        if cfg.partial_rotary_factor.is_some() {
                             Some(rotary_dim)
                         } else {
                             None
                         },
-                    })
+                    )?)
                 } else if rope_type == "yarn" {
                     let default_one = ScalingValue::Single(1.0);
                     let default_fast = ScalingValue::Single(32.0);
@@ -313,7 +345,7 @@ impl ScalingRotaryEmbedding {
                             Some(ScalingValue::Single(factor)),
                         ) => {
                             let embed = YarnRotaryEmbedding::new_yarn(
-                                dtype,
+                                rope_elem_dtype,
                                 dev,
                                 cfg.rope_theta as f32,
                                 rotary_dim,
@@ -325,19 +357,16 @@ impl ScalingRotaryEmbedding {
                                 *extrapolation_factor as f32,
                                 *factor as f32,
                             )?;
-                            let cos_sin =
-                                Tensor::cat(&[&embed.cos, &embed.sin], candle::D::Minus1)?; //must be contiguous tensor;
-                            Self(DefaultRotaryEmbedding {
-                                sin: embed.sin,
-                                cos: embed.cos,
-                                cos_sin,
+                            Self(default_rotary_embedding_from_cos_sin(
+                                embed.cos,
+                                embed.sin,
                                 is_gpt_neox,
-                                rotary_dim: if cfg.partial_rotary_factor.is_some() {
+                                if cfg.partial_rotary_factor.is_some() {
                                     Some(rotary_dim)
                                 } else {
                                     None
                                 },
-                            })
+                            )?)
                         }
                         _ => {
                             candle_core::bail!("yarn rope_type requires factor to be set");
@@ -352,7 +381,7 @@ impl ScalingRotaryEmbedding {
             }
         } else {
             Ok(Self(DefaultRotaryEmbedding::new(
-                dtype,
+                rope_elem_dtype,
                 cfg,
                 dev,
                 is_gpt_neox,

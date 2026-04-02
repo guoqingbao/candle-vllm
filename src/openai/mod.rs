@@ -12,6 +12,7 @@ use tokenizers::{EncodeInput, Encoding, Tokenizer};
 #[cfg(feature = "eccl")]
 pub mod communicator;
 pub mod distributed;
+pub mod logger;
 pub mod requests;
 pub mod responses;
 pub mod sampling_params;
@@ -44,6 +45,39 @@ pub struct PipelineConfig {
     pub max_model_len: usize,
     pub default_max_tokens: usize,
     pub generation_cfg: Option<GenerationConfig>,
+}
+
+impl PipelineConfig {
+    pub fn apply_kv_cache_limit(
+        &mut self,
+        cache_config: &crate::scheduler::cache_engine::CacheConfig,
+    ) {
+        self.max_model_len = resolve_final_max_model_len(self.max_model_len, cache_config);
+        self.default_max_tokens = self.default_max_tokens.min(self.max_model_len);
+    }
+}
+
+pub fn kv_cache_capacity_tokens(
+    cache_config: &crate::scheduler::cache_engine::CacheConfig,
+) -> usize {
+    cache_config
+        .num_gpu_blocks
+        .map(|blocks| blocks.saturating_mul(cache_config.block_size))
+        .unwrap_or(0)
+}
+
+pub fn resolve_final_max_model_len(
+    model_max_len: usize,
+    cache_config: &crate::scheduler::cache_engine::CacheConfig,
+) -> usize {
+    let kv_cache_capacity = kv_cache_capacity_tokens(cache_config);
+    let kv_cache_capacity = if kv_cache_capacity == 0 {
+        model_max_len
+    } else {
+        kv_cache_capacity
+    };
+
+    model_max_len.min(kv_cache_capacity)
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -95,11 +129,17 @@ pub struct TaskData {
     pub is_embedding: bool,
     pub encoding_format: requests::EncodingFormat,
     pub embedding_type: requests::EmbeddingType,
+    pub tools: Vec<Tool>,
+    pub images: Option<multimodal::ImageData>,
+    pub include_usage: bool,
+    #[serde(default)]
+    pub prefilled_reasoning_end: Option<String>,
 }
 
 pub mod conversation;
 pub mod logits_processor;
 pub mod models;
+pub mod multimodal;
 pub mod openai_server;
 pub mod pipelines;
 pub mod utils;
@@ -123,10 +163,10 @@ fn normalize_tool_choice(choice: &Option<ToolChoice>) -> ToolChoiceKind {
         Some(ToolChoice::Function { function, .. }) => {
             ToolChoiceKind::Function(function.name.clone())
         }
-        Some(ToolChoice::Auto(value)) | Some(ToolChoice::None(value)) => match value.as_str() {
-            "none" => ToolChoiceKind::None,
-            "auto" => ToolChoiceKind::Auto,
-            _ => ToolChoiceKind::Auto,
+        Some(ToolChoice::Mode(mode)) => match mode {
+            crate::tools::ToolChoiceMode::Auto => ToolChoiceKind::Auto,
+            crate::tools::ToolChoiceMode::None => ToolChoiceKind::None,
+            crate::tools::ToolChoiceMode::Required => ToolChoiceKind::Auto,
         },
     }
 }

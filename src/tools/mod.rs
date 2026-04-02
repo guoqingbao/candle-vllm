@@ -1,15 +1,17 @@
 // src/tools/mod.rs
-//! Tool calling support for vLLM.rs
+//! Tool calling support for candle-vLLM
 //!
 //! This module provides OpenAI-compatible tool calling functionality,
 //! allowing LLMs to invoke external functions and tools.
 
+pub mod helpers;
 pub mod parser;
 pub mod schema;
 pub mod stream_parser;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use uuid::Uuid;
 
 /// A tool definition following OpenAI's function calling format
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -21,11 +23,9 @@ pub struct Tool {
     pub function: FunctionDefinition,
 }
 
-impl Tool {
-    /// Create a new function tool
-    pub fn function(name: impl Into<String>, description: impl Into<String>) -> ToolBuilder {
-        ToolBuilder::new(name.into(), description.into())
-    }
+/// Builder entry point — create a new function tool builder.
+pub fn function_tool(name: impl Into<String>, description: impl Into<String>) -> ToolBuilder {
+    ToolBuilder::new(name.into(), description.into())
 }
 
 /// Definition of a callable function
@@ -34,7 +34,8 @@ pub struct FunctionDefinition {
     /// Name of the function
     pub name: String,
     /// Description of what the function does
-    pub description: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
     /// JSON Schema for the function parameters
     pub parameters: Value,
     /// Whether to enable strict schema adherence
@@ -107,7 +108,7 @@ impl ToolBuilder {
             tool_type: "function".to_string(),
             function: FunctionDefinition {
                 name: self.name,
-                description: self.description,
+                description: Some(self.description),
                 parameters: self.parameters,
                 strict: self.strict,
             },
@@ -119,33 +120,49 @@ impl ToolBuilder {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum ToolChoice {
-    /// Let the model decide
-    Auto(String),
-    /// Force no tool usage
-    None(String),
+    /// String modes: "auto" | "none" | "required"
+    Mode(ToolChoiceMode),
     /// Force a specific tool
     Function {
         #[serde(rename = "type")]
-        choice_type: String,
+        choice_type: ToolChoiceType,
         function: ToolChoiceFunction,
     },
 }
 
 impl ToolChoice {
     pub fn auto() -> Self {
-        ToolChoice::Auto("auto".to_string())
+        ToolChoice::Mode(ToolChoiceMode::Auto)
     }
 
     pub fn none() -> Self {
-        ToolChoice::None("none".to_string())
+        ToolChoice::Mode(ToolChoiceMode::None)
+    }
+
+    pub fn required() -> Self {
+        ToolChoice::Mode(ToolChoiceMode::Required)
     }
 
     pub fn function(name: impl Into<String>) -> Self {
         ToolChoice::Function {
-            choice_type: "function".to_string(),
+            choice_type: ToolChoiceType::Function,
             function: ToolChoiceFunction { name: name.into() },
         }
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ToolChoiceMode {
+    Auto,
+    None,
+    Required,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ToolChoiceType {
+    Function,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -201,6 +218,35 @@ pub struct FunctionCall {
     pub arguments: String,
 }
 
+/// Build a ToolCall from name/arguments with a provided ID.
+pub fn new_tool_call(
+    id: impl Into<String>,
+    name: impl Into<String>,
+    arguments: impl Into<String>,
+) -> ToolCall {
+    ToolCall::new(id, name, arguments)
+}
+
+/// Generate a compact tool call ID with `call_` prefix.
+/// Uses 16 hex chars (64 bits) from UUIDv4 for low collision risk and shorter payloads.
+pub fn generate_tool_call_id() -> String {
+    let raw = Uuid::new_v4().simple().to_string();
+    format!("call_{}", &raw[..16])
+}
+
+/// Convert a parsed tool call from the `tool_parser` crate into our ToolCall type.
+pub fn tool_call_from_parser(parsed: tool_parser::ToolCall) -> ToolCall {
+    ToolCall {
+        index: None,
+        id: generate_tool_call_id(),
+        call_type: "function".to_string(),
+        function: FunctionCall {
+            name: parsed.function.name,
+            arguments: parsed.function.arguments,
+        },
+    }
+}
+
 /// Result of a tool execution
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolResult {
@@ -238,26 +284,169 @@ impl ToolResult {
 pub struct ToolFormat {}
 
 impl ToolFormat {
+    fn parser_name_for_prompt(
+        tool_config: &crate::tools::stream_parser::ToolConfig,
+        model_type: &crate::tools::stream_parser::ToolModelType,
+        model_id: &str,
+        enforce_parser: Option<&str>,
+    ) -> &'static str {
+        if let Some(name) = enforce_parser.map(str::trim).filter(|s| !s.is_empty()) {
+            return match name {
+                "qwen_coder" => "qwen_coder",
+                "json" => "json",
+                "qwen" => "qwen",
+                "mistral" => "mistral",
+                "llama" => "llama",
+                "glm47_moe" => "glm47_moe",
+                "deepseek" => "deepseek",
+                _ => {
+                    if tool_config.start_token_str.contains("tool_call") {
+                        "qwen"
+                    } else {
+                        "json"
+                    }
+                }
+            };
+        }
+
+        let model_lower = model_id.to_ascii_lowercase();
+        match model_type {
+            crate::tools::stream_parser::ToolModelType::LLaMa => "llama",
+            crate::tools::stream_parser::ToolModelType::Mistral => "mistral",
+            crate::tools::stream_parser::ToolModelType::Qwen
+            | crate::tools::stream_parser::ToolModelType::Qwen3MoE => {
+                if model_lower.contains("coder") || model_lower.contains("qwen3.5") {
+                    "qwen_coder"
+                } else {
+                    "qwen"
+                }
+            }
+            crate::tools::stream_parser::ToolModelType::Gemma
+            | crate::tools::stream_parser::ToolModelType::Gemma3
+            | crate::tools::stream_parser::ToolModelType::GLM4 => "json",
+            crate::tools::stream_parser::ToolModelType::Phi
+            | crate::tools::stream_parser::ToolModelType::Phi4
+            | crate::tools::stream_parser::ToolModelType::Yi
+            | crate::tools::stream_parser::ToolModelType::StableLM => "qwen",
+            crate::tools::stream_parser::ToolModelType::DeepSeek => "deepseek",
+        }
+    }
+
     /// Get tool prompt for a specific tool config (model-aware tags).
-    /// Tool definitions are injected by the chat template - this only provides usage instructions.
-    pub fn get_tool_prompt(tool_config: &crate::tools::stream_parser::ToolConfig) -> String {
+    /// Tool definitions are injected by the chat template — this only provides usage instructions.
+    pub fn get_tool_prompt(
+        tool_config: &crate::tools::stream_parser::ToolConfig,
+        model_type: &crate::tools::stream_parser::ToolModelType,
+        model_id: &str,
+        enforce_parser: Option<&str>,
+    ) -> String {
         let start_tag = &tool_config.start_token_str;
         let end_tag = &tool_config.end_token_str;
-        format!(
-            "MOST IMPORTANT INSTRUCTION, **MUST** FOLLOW:\n\
-            For each function call, you MUST wrap function name and arguments in {start_tag}{end_tag} tags.\n\n\
-            Do NOT USE ANY code blocks. Required format:\n\
-            {start_tag}\n\
-            {{\"name\": \"<function-name>\", \"arguments\": <args-json-object>}}\n\
-            {end_tag}\n\n\
-            Rules:\n\
-            - Wrap function name and arguments with {start_tag} and {end_tag} tags\n\
-            - Always use the exact {start_tag}{end_tag} format shown above\n\
-            - Do NOT USE ANY code blocks\n\
-            - Tool-use must be placed **at the end** of your response (AFTER reasoning), **top-level**, and not nested within other tags.\n\
-            - Always adhere to this format for the tool use to ensure proper parsing and execution.\n\
-            - The \"name\" and \"arguments\" are necessary fields\n\
-            - MUST FOLLOW the above instruction when using tool call!"
-        )
+        match Self::parser_name_for_prompt(tool_config, model_type, model_id, enforce_parser) {
+            "qwen_coder" => format!(
+                "MOST IMPORTANT INSTRUCTION, **MUST** FOLLOW:\n\
+                For each function call, you MUST wrap the function block in {start_tag}{end_tag} tags.\n\n\
+                Do NOT USE ANY code blocks. Required format:\n\
+                {start_tag}\n\
+                <function=<function-name>>\n\
+                <parameter=<required-parameter-1>>value</parameter>\n\
+                <parameter=<required-parameter-2>>value</parameter>\n\
+                </function>\n\
+                {end_tag}\n\n\
+                Rules:\n\
+                - Use XML-style <function=...> and <parameter=...> tags inside {start_tag}{end_tag}\n\
+                - Do NOT emit JSON for tool calls\n\
+                - Required parameters MUST be provided using their own <parameter=...></parameter> blocks\n\
+                - Tool-use must be placed **at the end** of your response (AFTER reasoning), **top-level**, and not nested within other tags.\n\
+                - Do NOT USE ANY code blocks\n\
+                - MUST FOLLOW the above instruction when using tool call!"
+            ),
+            _ => format!(
+                "MOST IMPORTANT INSTRUCTION, **MUST** FOLLOW:\n\
+                For each function call, you MUST wrap function name and arguments in {start_tag}{end_tag} tags.\n\n\
+                Do NOT USE ANY code blocks. Required format:\n\
+                {start_tag}\n\
+                {{\"name\": \"<function-name>\", \"arguments\": <args-json-object>}}\n\
+                {end_tag}\n\n\
+                Rules:\n\
+                - Wrap function name and arguments with {start_tag} and {end_tag} tags\n\
+                - Always use the exact {start_tag}{end_tag} format shown above\n\
+                - Do NOT USE ANY code blocks\n\
+                - Tool-use must be placed **at the end** of your response (AFTER reasoning), **top-level**, and not nested within other tags.\n\
+                - Always adhere to this format for the tool use to ensure proper parsing and execution.\n\
+                - The \"name\" and \"arguments\" are necessary fields\n\
+                - MUST FOLLOW the above instruction when using tool call!"
+            ),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tools::stream_parser::{ToolConfig, ToolModelType};
+
+    #[test]
+    fn tool_choice_deserializes_string_modes() {
+        let auto: ToolChoice = serde_json::from_str(r#""auto""#).unwrap();
+        let none: ToolChoice = serde_json::from_str(r#""none""#).unwrap();
+        let required: ToolChoice = serde_json::from_str(r#""required""#).unwrap();
+
+        assert!(matches!(auto, ToolChoice::Mode(ToolChoiceMode::Auto)));
+        assert!(matches!(none, ToolChoice::Mode(ToolChoiceMode::None)));
+        assert!(matches!(
+            required,
+            ToolChoice::Mode(ToolChoiceMode::Required)
+        ));
+    }
+
+    #[test]
+    fn tool_choice_deserializes_function_mode() {
+        let choice: ToolChoice =
+            serde_json::from_str(r#"{"type":"function","function":{"name":"read_file"}}"#).unwrap();
+        match choice {
+            ToolChoice::Function {
+                choice_type,
+                function,
+            } => {
+                assert_eq!(choice_type, ToolChoiceType::Function);
+                assert_eq!(function.name, "read_file");
+            }
+            _ => panic!("expected function tool choice"),
+        }
+    }
+
+    #[test]
+    fn generate_tool_call_id_has_correct_format() {
+        let id = generate_tool_call_id();
+        assert!(id.starts_with("call_"));
+        assert_eq!(id.len(), 5 + 16); // "call_" + 16 hex chars
+    }
+
+    #[test]
+    fn tool_prompt_uses_xml_for_qwen_coder_models() {
+        let prompt = ToolFormat::get_tool_prompt(
+            &ToolConfig::for_model_type(&ToolModelType::Qwen),
+            &ToolModelType::Qwen,
+            "qwen3-coder",
+            None,
+        );
+        assert!(prompt.contains("<function=<function-name>>"));
+        assert!(prompt.contains("<parameter=<required-parameter-1>>value</parameter>"));
+        assert!(prompt.contains("Do NOT emit JSON for tool calls"));
+    }
+
+    #[test]
+    fn tool_prompt_uses_json_for_regular_qwen_models() {
+        let prompt = ToolFormat::get_tool_prompt(
+            &ToolConfig::for_model_type(&ToolModelType::Qwen),
+            &ToolModelType::Qwen,
+            "qwen3-instruct",
+            None,
+        );
+        assert!(
+            prompt.contains("{\"name\": \"<function-name>\", \"arguments\": <args-json-object>}")
+        );
+        assert!(!prompt.contains("Do NOT emit JSON for tool calls"));
     }
 }

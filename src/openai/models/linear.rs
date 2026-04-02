@@ -6,9 +6,9 @@
 //! output has shape `(b_sz, out_c)` and `(out_c,)` respectively.
 //!
 //! ```rust
-//! use candle::{Tensor, Device::Cpu};
+//! use candle_core::{Tensor, Device::Cpu};
 //! use candle_nn::{Linear, Module};
-//! # fn main() -> candle::Result<()> {
+//! # fn main() -> candle_core::Result<()> {
 //!
 //! let w = Tensor::new(&[[1f32, 2.], [3., 4.], [5., 6.]], &Cpu)?;
 //! let layer = Linear::new(w, None); // Use no bias.
@@ -22,7 +22,6 @@ use super::QuantConfig;
 use crate::backend::gptq::{gptq_matmul, marlin_weight_repack};
 #[cfg(feature = "gcu")]
 use candle_nn::{gptq_matmul, marlin_weight_repack};
-
 use crate::candle::Module;
 use crate::candle::{
     quantized::{gguf_file, QMatMul, QTensor},
@@ -33,7 +32,38 @@ use candle_core::quantized;
 pub use candle_nn::var_builder::Shard;
 pub use candle_nn::var_builder::ShardedVarBuilder as VarBuilder;
 
+use std::cell::Cell;
 use std::sync::Arc;
+use tracing::warn;
+
+thread_local! {
+    static FP8_LINEAR_IS_PREFILL: Cell<bool> = const { Cell::new(false) };
+}
+
+pub struct Fp8LinearPrefillGuard {
+    prev: bool,
+}
+
+impl Drop for Fp8LinearPrefillGuard {
+    fn drop(&mut self) {
+        FP8_LINEAR_IS_PREFILL.with(|flag| flag.set(self.prev));
+    }
+}
+
+pub fn set_fp8_linear_is_prefill(is_prefill: bool) -> Fp8LinearPrefillGuard {
+    let prev = FP8_LINEAR_IS_PREFILL.with(|flag| {
+        let prev = flag.get();
+        flag.set(is_prefill);
+        prev
+    });
+    Fp8LinearPrefillGuard { prev }
+}
+
+#[cfg(feature = "flashinfer")]
+fn fp8_linear_is_prefill() -> bool {
+    FP8_LINEAR_IS_PREFILL.with(|flag| flag.get())
+}
+
 #[derive(Clone, Debug)]
 pub struct Linear {
     weight: Tensor,
@@ -80,13 +110,13 @@ impl Linear {
         self.workspace.as_ref()
     }
 
-    #[cfg(feature = "gcu")]
+    #[cfg(any(feature = "cuda", feature = "gcu"))]
     pub fn reload(&mut self) -> Result<()> {
         self.weight = self.weight.reload()?;
         Ok(())
     }
 
-    #[cfg(feature = "gcu")]
+    #[cfg(any(feature = "cuda", feature = "gcu"))]
     pub fn offload(&mut self) -> Result<()> {
         self.weight = self.weight.offload()?;
         Ok(())
@@ -190,15 +220,6 @@ pub fn linear_b(
     }
 }
 
-pub fn check_k_dim(k_dim: usize, pack_factor: usize, bits: usize, quant_method: &String) -> usize {
-    let out_dim = if bits == 4 && quant_method == "awq" && k_dim % 128 != 0 {
-        ((k_dim + 128 - 1) / 128) * 128 //align up k-dim to 128 in awq on gcu
-    } else {
-        k_dim
-    };
-    out_dim / pack_factor
-}
-
 pub fn qlinear(
     in_dim: usize,
     out_dim: usize,
@@ -220,35 +241,23 @@ pub fn qlinear(
             let marlin_format = cfg.checkpoint_format.is_some()
                 && cfg.checkpoint_format.as_ref().unwrap() == "marlin";
 
-            let (wtype, pack_factor) = if vb.device().is_gcu() {
-                if cfg.bits == 4 {
-                    (DType::U8, 2) //w4a16
-                } else {
-                    (DType::I8, 1) //because GCU format repacked to i8 (instead of u32)
-                }
-            } else {
-                (DType::U32, 32 / cfg.bits)
-            };
-
-            let dim = if shards.world_size > 1 {
-                if shards.dim == 1 {
-                    0
-                } else {
-                    1
-                }
-            } else {
-                0
-            };
-
-            //enflame nk format
             let ws = vb.get_with_hints_dtype(
-                (
-                    out_dim,
-                    check_k_dim(in_dim, pack_factor, cfg.bits, &cfg.quant_method),
-                ),
+                if cfg.quant_method == "gptq" {
+                    //quantized gptq (k/pack_factor, n) format
+                    (
+                        in_dim / (32 / cfg.bits) / if marlin_format { 2 } else { 1 },
+                        out_dim * if marlin_format { 2 } else { 1 },
+                    )
+                } else {
+                    //quantized awq (k, n/pack_factor) format
+                    (
+                        in_dim * if marlin_format { 2 } else { 1 },
+                        out_dim / (32 / cfg.bits) / if marlin_format { 2 } else { 1 },
+                    )
+                },
                 if marlin_format { "B" } else { "qweight" },
-                shard(dim, shards.rank, shards.world_size),
-                wtype,
+                shards,
+                DType::U32,
             )?;
 
             let scale_and_zero_size = in_dim / (cfg.group_size as usize);
@@ -299,31 +308,13 @@ pub fn qlinear(
                     workspace: Some(workspace),
                 })
             } else {
-                let qzeros = if cfg.bits == 4 {
-                    //non-marlin format has qzeros
-                    let qzeros = vb.get_with_hints_dtype(
-                        (scale_and_zero_size, out_dim),
-                        "qzeros",
-                        shards,
-                        if scales.device().is_gcu() {
-                            DType::F16
-                        } else {
-                            DType::U32
-                        },
-                    )?;
-
-                    let qzeros = if qzeros.device().is_gcu() {
-                        qzeros.to_dtype(dtype)?
-                    } else {
-                        qzeros
-                    };
-                    Some(qzeros)
-                } else {
-                    None
-                };
-
-                let g_idx = if cfg.bits == 4 && !scales.device().is_gcu() {
-                    //we removed g_idx in gcu platform since we repacked the weights
+                let qzeros = vb.get_with_hints_dtype(
+                    (scale_and_zero_size, out_dim / (32 / cfg.bits)),
+                    "qzeros",
+                    shards,
+                    DType::U32,
+                )?;
+                let g_idx = if cfg.quant_method == "gptq" {
                     let mut g_idx = vb.get_with_hints_dtype(
                         (in_dim,),
                         "g_idx",
@@ -344,8 +335,7 @@ pub fn qlinear(
                     None
                 };
 
-                if ws.device().is_gcu()
-                    || (cfg.sym.is_some() && !cfg.sym.unwrap())
+                if (cfg.sym.is_some() && !cfg.sym.unwrap())
                     || cfg.bits != 4
                     || !matches!(cfg.group_size, 64 | 128 | -1)
                     || (cfg.desc_act.is_some()
@@ -355,15 +345,15 @@ pub fn qlinear(
                     //only model with 4-bit and desc_act==false can be repacked to marlin format
                     #[cfg(not(feature = "gcu"))]
                     if cfg.quant_method == "marlin" {
-                        tracing::warn!("The current GPTQ model does no compatible with marlin format because one of the following conditions: !cfg.sym || cfg.bits != 4 || (cfg.group_size != 128 && cfg.group_size != -1) || (cfg.desc_act == true)");
+                        warn!("The current GPTQ model does no compatible with marlin format because one of the following conditions: !cfg.sym || cfg.bits != 4 || (cfg.group_size != 128 && cfg.group_size != -1) || (cfg.desc_act == true)");
                     }
                     //conventional gptq format
                     Ok(Linear {
                         weight: ws,
                         bias: bs,
                         scales: Some(scales),
-                        qzeros: qzeros,
-                        g_idx: g_idx,
+                        qzeros: Some(qzeros),
+                        g_idx,
                         workspace: None,
                     })
                 } else {
@@ -431,8 +421,8 @@ pub fn qlinear(
                         weight: ws,
                         bias: bs,
                         scales: Some(scales),
-                        qzeros: qzeros,
-                        g_idx: g_idx,
+                        qzeros: Some(qzeros),
+                        g_idx,
                         workspace: Some(workspace),
                     })
                 }
@@ -573,8 +563,6 @@ impl QLinear {
                 assert!(
                     cfg.quant_method == "gptq"
                         || cfg.quant_method == "awq"
-                        || cfg.quant_method == "w8a16"
-                        || quant == "w8a16"
                         || cfg.quant_method == "marlin"
                         || quant == "marlin"
                 );
@@ -652,7 +640,7 @@ impl QLinear {
         self.bias.as_mut()
     }
 
-    #[cfg(feature = "gcu")]
+    #[cfg(any(feature = "cuda", feature = "gcu"))]
     pub fn offload(&mut self) -> Result<()> {
         let w = match &self.inner {
             QMatMul::Tensor(qw) => qw.offload()?,
@@ -664,7 +652,7 @@ impl QLinear {
         Ok(())
     }
 
-    #[cfg(feature = "gcu")]
+    #[cfg(any(feature = "cuda", feature = "gcu"))]
     pub fn reload(&mut self) -> Result<()> {
         let w = match &self.inner {
             QMatMul::Tensor(qw) => qw.reload()?,
@@ -677,32 +665,7 @@ impl QLinear {
     }
 }
 
-#[allow(dead_code)]
 impl QLinear {
-    #[cfg(feature = "gcu")]
-    fn forward_dequant(&self, x: &Tensor) -> Result<Tensor> {
-        let weight = match x.dtype() {
-            DType::BF16 => self.inner.dequantize_bf16()?,
-            DType::F16 => self.inner.dequantize_f16()?,
-            DType::F32 => self.inner.dequantize()?,
-            _ => {
-                panic!("Invalid format for dequantization!");
-            }
-        };
-
-        let x = match *x.dims() {
-            [b1, b2, _, _] => x.matmul(&weight.broadcast_left((b1, b2))?.t()?)?,
-            [bsize, _, _] => x.matmul(&weight.broadcast_left(bsize)?.t()?)?,
-            _ => x.matmul(&weight.t()?)?,
-        };
-
-        // let x = x.matmul(&w)?;
-        match &self.bias {
-            None => Ok(x),
-            Some(bias) => x.broadcast_add(bias),
-        }
-    }
-
     pub fn forward_no_dequant(&self, x: &Tensor) -> Result<Tensor> {
         let xs = match *x.dims() {
             [bsize, seq_len, dim1, dim2] => {
@@ -784,7 +747,6 @@ impl QLinear {
 }
 
 impl Module for QLinear {
-    #[allow(unused_variables)]
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
         match (
             &self.inner,
@@ -798,29 +760,42 @@ impl Module for QLinear {
                 let x = match *x.dims() {
                     [bsize, seq_len, dim1, dim2] => {
                         #[cfg(feature = "gcu")]
-                        let qw = &qw.broadcast_left((bsize, seq_len))?.t()?;
+                        {
+                            let qw = &qw.broadcast_left((bsize, seq_len))?.t()?;
+                            gptq_matmul(
+                                x,
+                                qw,
+                                scale,
+                                qzeros,
+                                g_idx,
+                                workspace,
+                                self.bits,
+                                self.group_size,
+                                self.is_awq,
+                            )?
+                        }
                         #[cfg(not(feature = "gcu"))]
-                        let x = x.reshape((bsize * seq_len, dim1, dim2))?;
-                        let o = gptq_matmul(
-                            &x,
-                            qw,
-                            scale,
-                            qzeros,
-                            g_idx,
-                            workspace,
-                            self.bits,
-                            self.group_size,
-                            self.is_awq,
-                        )?;
-                        #[cfg(not(feature = "gcu"))]
-                        let o = o.reshape((bsize, seq_len, dim1, ()))?;
-                        o
+                        {
+                            let x = x.reshape((bsize * seq_len, dim1, dim2))?;
+                            let o = gptq_matmul(
+                                &x,
+                                qw,
+                                scale,
+                                qzeros,
+                                g_idx,
+                                workspace,
+                                self.bits,
+                                self.group_size,
+                                self.is_awq,
+                            )?;
+                            o.reshape((bsize, seq_len, dim1, ()))?
+                        }
                     }
                     [bsize, _, _] => {
                         #[cfg(feature = "gcu")]
                         let qw = &qw.broadcast_left(bsize)?.t()?;
                         gptq_matmul(
-                            &x,
+                            x,
                             qw,
                             scale,
                             qzeros,
@@ -833,23 +808,36 @@ impl Module for QLinear {
                     }
                     [seq_len, dim] => {
                         #[cfg(feature = "gcu")]
-                        let qw = &qw.t()?;
+                        {
+                            let qw = &qw.t()?;
+                            gptq_matmul(
+                                x,
+                                qw,
+                                scale,
+                                qzeros,
+                                g_idx,
+                                workspace,
+                                self.bits,
+                                self.group_size,
+                                self.is_awq,
+                            )?
+                        }
                         #[cfg(not(feature = "gcu"))]
-                        let x = x.reshape((1, seq_len, dim))?;
-                        let o = gptq_matmul(
-                            &x,
-                            qw,
-                            scale,
-                            qzeros,
-                            g_idx,
-                            workspace,
-                            self.bits,
-                            self.group_size,
-                            self.is_awq,
-                        )?;
-                        #[cfg(not(feature = "gcu"))]
-                        let o = o.reshape((seq_len, ()))?;
-                        o
+                        {
+                            let x = x.reshape((1, seq_len, dim))?;
+                            let o = gptq_matmul(
+                                &x,
+                                qw,
+                                scale,
+                                qzeros,
+                                g_idx,
+                                workspace,
+                                self.bits,
+                                self.group_size,
+                                self.is_awq,
+                            )?;
+                            o.reshape((seq_len, ()))?
+                        }
                     }
                     _ => panic!("Invalid input format!"),
                 };
@@ -876,6 +864,7 @@ impl Module for QLinear {
 pub struct LnFp8 {
     pub weight: Tensor,
     pub weight_scale: Tensor,
+    pub weight_scale_cutlass: Option<Tensor>,
     pub bias: Option<Tensor>,
     pub weight_block_size: Vec<usize>,
     pub sm_version: usize,
@@ -934,13 +923,16 @@ impl LnFp8 {
         let sm_version = 0;
 
         #[cfg(feature = "cutlass")]
-        let weight_scale = if sm_version >= 100 {
-            weight_scale.t()?
+        let weight_scale_cutlass = if sm_version >= 100 {
+            Some(weight_scale.t()?)
         } else if sm_version >= 90 {
-            weight_scale.t()?.contiguous()?
+            Some(weight_scale.t()?.contiguous()?)
         } else {
-            weight_scale
+            None
         };
+
+        #[cfg(not(feature = "cutlass"))]
+        let weight_scale_cutlass = None;
 
         // Load bias if present
         let bias = vb.get((out_dim,), "bias");
@@ -962,11 +954,174 @@ impl LnFp8 {
         Ok(Self {
             weight,
             weight_scale,
+            weight_scale_cutlass,
             bias,
             weight_block_size: block_size,
             sm_version,
         })
     }
+}
+
+fn load_ln_fp8_with_hints(
+    in_dim: usize,
+    out_dim: usize,
+    vb: VarBuilder,
+    shard: Shard,
+    quant_cfg: &QuantConfig,
+    load_bias: bool,
+) -> Result<LnFp8> {
+    fn normalize_sharded_2d(
+        t: Tensor,
+        shard: Shard,
+        global_dim0: usize,
+        global_dim1: usize,
+        name: &str,
+    ) -> Result<Tensor> {
+        if shard.world_size <= 1 {
+            return Ok(t);
+        }
+        if shard.dim > 1 {
+            candle_core::bail!("LnFp8: unsupported shard dim {} for {}", shard.dim, name);
+        }
+        let (d0, d1) = t.dims2()?;
+        if shard.dim == 0 {
+            let local = global_dim0 / shard.world_size;
+            if d0 == local {
+                return Ok(t);
+            }
+            if d0 == global_dim0 {
+                return t.narrow(0, shard.rank * local, local)?.contiguous();
+            }
+            candle_core::bail!(
+                "LnFp8: unexpected {} shape ({}, {}), shard dim 0 expects local {} or global {}",
+                name,
+                d0,
+                d1,
+                local,
+                global_dim0
+            )
+        } else {
+            let local = global_dim1 / shard.world_size;
+            if d1 == local {
+                return Ok(t);
+            }
+            if d1 == global_dim1 {
+                return t.narrow(1, shard.rank * local, local)?.contiguous();
+            }
+            candle_core::bail!(
+                "LnFp8: unexpected {} shape ({}, {}), shard dim 1 expects local {} or global {}",
+                name,
+                d0,
+                d1,
+                local,
+                global_dim1
+            )
+        }
+    }
+
+    fn normalize_sharded_1d(
+        t: Tensor,
+        shard: Shard,
+        global_dim: usize,
+        name: &str,
+    ) -> Result<Tensor> {
+        if shard.world_size <= 1 {
+            return Ok(t);
+        }
+        let d0 = t.dim(0)?;
+        let local = global_dim / shard.world_size;
+        if d0 == local {
+            return Ok(t);
+        }
+        if d0 == global_dim {
+            return t.narrow(0, shard.rank * local, local)?.contiguous();
+        }
+        candle_core::bail!(
+            "LnFp8: unexpected {} shape ({}), expects local {} or global {}",
+            name,
+            d0,
+            local,
+            global_dim
+        )
+    }
+
+    let block_size = quant_cfg
+        .weight_block_size
+        .clone()
+        .unwrap_or(vec![128, 128]);
+    if block_size.len() != 2 {
+        candle_core::bail!("LnFp8: weight_block_size must have 2 elements");
+    }
+
+    let by = block_size[0];
+    let bx = block_size[1];
+    let scale_dim0 = (out_dim + by - 1) / by;
+    let scale_dim1 = (in_dim + bx - 1) / bx;
+
+    let weight = vb.get_with_hints_dtype((out_dim, in_dim), "weight", shard, DType::U8)?;
+    let weight = normalize_sharded_2d(weight, shard, out_dim, in_dim, "weight")?;
+    let weight_scale = match vb.get_with_hints_dtype(
+        (scale_dim0, scale_dim1),
+        "weight_scale",
+        shard,
+        DType::F32,
+    ) {
+        Ok(s) => s,
+        Err(_) => vb
+            .get_with_hints_dtype(
+                (scale_dim0, scale_dim1),
+                "weight_scale_inv",
+                shard,
+                DType::F32,
+            )
+            .map_err(|_| {
+                candle_core::Error::Msg("LnFp8: Missing weight_scale or weight_scale_inv".into())
+            })?,
+    };
+    let weight_scale = normalize_sharded_2d(
+        weight_scale,
+        shard,
+        scale_dim0,
+        scale_dim1,
+        "weight_scale(_inv)",
+    )?;
+
+    #[cfg(feature = "cuda")]
+    let sm_version =
+        attention_rs::cuda_utils::sm_version(vb.device().as_cuda_device()?).unwrap_or(0) as usize;
+
+    #[cfg(not(feature = "cuda"))]
+    let sm_version = 0;
+
+    #[cfg(feature = "cutlass")]
+    let weight_scale_cutlass = if sm_version >= 100 {
+        Some(weight_scale.t()?)
+    } else if sm_version >= 90 {
+        Some(weight_scale.t()?.contiguous()?)
+    } else {
+        None
+    };
+
+    #[cfg(not(feature = "cutlass"))]
+    let weight_scale_cutlass = None;
+
+    let bias = if load_bias {
+        vb.get_with_hints_dtype((out_dim,), "bias", shard, DType::F32)
+            .ok()
+            .map(|b| normalize_sharded_1d(b, shard, out_dim, "bias"))
+            .transpose()?
+    } else {
+        None
+    };
+
+    Ok(LnFp8 {
+        weight,
+        weight_scale,
+        weight_scale_cutlass,
+        bias,
+        weight_block_size: block_size,
+        sm_version,
+    })
 }
 
 impl Module for LnFp8 {
@@ -982,12 +1137,66 @@ impl Module for LnFp8 {
 
         let x_2d = x.reshape((m, k))?;
 
+        #[cfg(feature = "flashinfer")]
+        let can_use_flashinfer_fp8 = (90..100).contains(&self.sm_version)
+            && x_2d.dtype() == DType::BF16
+            && self.weight_block_size.as_slice() == &[128, 128]
+            && !fp8_linear_is_prefill()
+            && m <= 64;
+
+        #[cfg(feature = "flashinfer")]
+        let out = if can_use_flashinfer_fp8 {
+            attention_rs::fp8_linear::fp8_matmul_flashinfer(
+                &x_2d,
+                &self.weight,
+                &self.weight_scale,
+            )?
+        } else {
+            #[cfg(feature = "cutlass")]
+            {
+                let weight_scale_cutlass = self
+                    .weight_scale_cutlass
+                    .as_ref()
+                    .unwrap_or(&self.weight_scale);
+                if self.sm_version >= 90 {
+                    attention_rs::fp8_linear::fp8_matmul_cutlass(
+                        &x_2d,
+                        &self.weight.t()?,
+                        weight_scale_cutlass,
+                        &self.weight_block_size,
+                    )?
+                } else {
+                    attention_rs::fp8_linear::fp8_matmul(
+                        &x_2d,
+                        &self.weight,
+                        &self.weight_scale,
+                        &self.weight_block_size,
+                    )?
+                }
+            }
+
+            #[cfg(not(feature = "cutlass"))]
+            {
+                attention_rs::fp8_linear::fp8_matmul(
+                    &x_2d,
+                    &self.weight,
+                    &self.weight_scale,
+                    &self.weight_block_size,
+                )?
+            }
+        };
+
+        #[cfg(not(feature = "flashinfer"))]
         #[cfg(feature = "cutlass")]
         let out = if self.sm_version >= 90 {
+            let weight_scale_cutlass = self
+                .weight_scale_cutlass
+                .as_ref()
+                .unwrap_or(&self.weight_scale);
             attention_rs::fp8_linear::fp8_matmul_cutlass(
                 &x_2d,
                 &self.weight.t()?,
-                &self.weight_scale,
+                weight_scale_cutlass,
                 &self.weight_block_size,
             )?
         } else {
@@ -1000,7 +1209,7 @@ impl Module for LnFp8 {
             )?
         };
 
-        #[cfg(not(feature = "cutlass"))]
+        #[cfg(all(not(feature = "flashinfer"), not(feature = "cutlass")))]
         let out = attention_rs::fp8_linear::fp8_matmul(
             &x_2d,
             &self.weight,
@@ -1058,6 +1267,7 @@ impl LinearX {
         }
     }
 
+    #[cfg(any(feature = "cuda", feature = "gcu"))]
     pub fn offload(&mut self) -> Result<()> {
         match self {
             LinearX::Linear(ln) => ln.offload(),
@@ -1076,6 +1286,35 @@ impl LinearX {
     }
 }
 
+fn should_bypass_quant_for_module(vb: &VarBuilder, quant_config: &Option<QuantConfig>) -> bool {
+    fn module_path_matches_not_convert(module_path: &str, item: &str) -> bool {
+        let module_path = module_path.trim_end_matches(".weight");
+        let item = item.trim_end_matches(".weight");
+        module_path == item
+            || module_path.ends_with(item)
+            || module_path.ends_with(&format!(".{item}"))
+            || item.ends_with(module_path)
+            || item.ends_with(&format!(".{module_path}"))
+    }
+
+    let Some(cfg) = quant_config else {
+        return false;
+    };
+    if cfg.quant_method != "fp8" {
+        return false;
+    }
+    let Some(skip_modules) = &cfg.modules_to_not_convert else {
+        return false;
+    };
+    let prefix = vb.prefix();
+    if prefix.is_empty() {
+        return false;
+    }
+    skip_modules
+        .iter()
+        .any(|m| module_path_matches_not_convert(&prefix, m))
+}
+
 pub fn linear_x(
     in_dim: usize,
     out_dim: usize,
@@ -1085,20 +1324,48 @@ pub fn linear_x(
     quant_config: &Option<QuantConfig>,
     dtype: DType,
 ) -> Result<LinearX> {
+    let bypass_quant = should_bypass_quant_for_module(&vb, quant_config);
+    let quant_config_local = if bypass_quant {
+        None
+    } else {
+        quant_config.clone()
+    };
+    let quant_local = if bypass_quant { None } else { quant.clone() };
+
     // Check for FP8 quantization first
-    if let Some(cfg) = quant_config {
+    if let Some(cfg) = &quant_config_local {
         if cfg.quant_method == "fp8" {
-            let ln = LnFp8::new(in_dim, out_dim, vb, shard, cfg)?;
+            let has_fp8_scale =
+                vb.contains_tensor("weight_scale") || vb.contains_tensor("weight_scale_inv");
+            if !has_fp8_scale {
+                let weight_probe = vb.get_with_hints((out_dim, in_dim), "weight", shard)?;
+                if matches!(
+                    weight_probe.dtype(),
+                    DType::BF16 | DType::F16 | DType::F32 | DType::F64
+                ) {
+                    let ln = linear(in_dim, out_dim, vb, shard)?;
+                    return Ok(LinearX::Linear(ln));
+                }
+            }
+            let ln = load_ln_fp8_with_hints(in_dim, out_dim, vb, shard, cfg, true)?;
             return Ok(LinearX::LnFp8(ln));
+        }
+        if matches!(cfg.quant_method.as_str(), "gptq" | "awq" | "marlin") {
+            let ln = qlinear(in_dim, out_dim, vb, shard, &quant_config_local, true, dtype)?;
+            return Ok(LinearX::QLinear(QLinear::from_linear_x(
+                ln,
+                cfg.quant_method.clone(),
+                &quant_config_local,
+            )));
         }
     }
 
-    if let Some(quantized_type) = quant {
-        let ln = qlinear(in_dim, out_dim, vb, shard, quant_config, true, dtype)?;
+    if let Some(quantized_type) = &quant_local {
+        let ln = qlinear(in_dim, out_dim, vb, shard, &quant_config_local, true, dtype)?;
         Ok(LinearX::QLinear(QLinear::from_linear_x(
             ln,
             quantized_type.clone(),
-            quant_config,
+            &quant_config_local,
         )))
     } else {
         let ln = linear(in_dim, out_dim, vb, shard)?;
@@ -1116,16 +1383,89 @@ pub fn linear_no_bias_x(
     dtype: DType,
     merged_chunks: Option<(usize, usize)>, //(chunk_idx, num_of_chunks)
 ) -> Result<LinearX> {
+    let bypass_quant = should_bypass_quant_for_module(&vb, quant_config);
+    let quant_config_local = if bypass_quant {
+        None
+    } else {
+        quant_config.clone()
+    };
+    let quant_local = if bypass_quant { None } else { quant.clone() };
+
     // Check for FP8 quantization first
-    if let Some(cfg) = quant_config {
+    if let Some(cfg) = &quant_config_local {
         if cfg.quant_method == "fp8" {
-            let ln = LnFp8::new(in_dim, out_dim, vb, shards, cfg)?;
+            let has_fp8_scale =
+                vb.contains_tensor("weight_scale") || vb.contains_tensor("weight_scale_inv");
+            if !has_fp8_scale {
+                let weight_probe = if let Some((chunk_idx, chunks)) = merged_chunks {
+                    vb.get_with_hints(
+                        (out_dim, in_dim),
+                        "weight",
+                        shard(
+                            shards.dim,
+                            chunk_idx * shards.world_size + shards.rank,
+                            chunks * shards.world_size,
+                        ),
+                    )?
+                } else {
+                    vb.get_with_hints((out_dim, in_dim), "weight", shards)?
+                };
+                if matches!(
+                    weight_probe.dtype(),
+                    DType::BF16 | DType::F16 | DType::F32 | DType::F64
+                ) {
+                    let ws = if let Some((chunk_idx, chunks)) = merged_chunks {
+                        vb.get_with_hints(
+                            (out_dim, in_dim),
+                            "weight",
+                            shard(
+                                shards.dim,
+                                chunk_idx * shards.world_size + shards.rank,
+                                chunks * shards.world_size,
+                            ),
+                        )?
+                    } else {
+                        vb.get_with_hints((out_dim, in_dim), "weight", shards)?
+                    };
+                    return Ok(LinearX::Linear(Linear::new(ws, None)));
+                }
+            }
+            let ln = load_ln_fp8_with_hints(in_dim, out_dim, vb, shards, cfg, false)?;
             return Ok(LinearX::LnFp8(ln));
+        }
+        if matches!(cfg.quant_method.as_str(), "gptq" | "awq" | "marlin") {
+            let ln = qlinear(
+                in_dim,
+                out_dim,
+                vb,
+                shard(
+                    if shards.world_size < 2 || shards.dim == 1 {
+                        0
+                    } else {
+                        1
+                    },
+                    shards.rank,
+                    shards.world_size,
+                ),
+                &quant_config_local,
+                false,
+                dtype,
+            )?;
+            return Ok(LinearX::QLinear(QLinear::from_linear_x(
+                ln,
+                cfg.quant_method.clone(),
+                &quant_config_local,
+            )));
         }
     }
 
-    if quant.is_some() && matches!(quant.as_ref().unwrap().as_str(), "gptq" | "awq" | "marlin") {
-        let quantized_type = quant.as_ref().unwrap().clone();
+    if quant_local.is_some()
+        && matches!(
+            quant_local.as_ref().unwrap().as_str(),
+            "gptq" | "awq" | "marlin"
+        )
+    {
+        let quantized_type = quant_local.as_ref().unwrap().clone();
         //quantized weight in k x n (shift dim in original shards)
         let ln = qlinear(
             in_dim,
@@ -1140,7 +1480,7 @@ pub fn linear_no_bias_x(
                 shards.rank,
                 shards.world_size,
             ),
-            quant_config,
+            &quant_config_local,
             false,
             dtype,
         )
@@ -1148,7 +1488,7 @@ pub fn linear_no_bias_x(
         Ok(LinearX::QLinear(QLinear::from_linear_x(
             ln,
             quantized_type.clone(),
-            quant_config,
+            &quant_config_local,
         )))
     } else {
         //weight in n x k (use original shards)
@@ -1168,12 +1508,12 @@ pub fn linear_no_bias_x(
         };
 
         let ln = Linear::new(ws, None);
-        if quant.is_some() {
-            let quantized_type = quant.as_ref().unwrap().clone();
+        if quant_local.is_some() {
+            let quantized_type = quant_local.as_ref().unwrap().clone();
             Ok(LinearX::QLinear(QLinear::from_linear_x(
                 ln,
                 quantized_type,
-                quant_config,
+                &quant_config_local,
             )))
         } else {
             Ok(LinearX::Linear(ln))

@@ -142,14 +142,7 @@ impl DeepSeek {
         };
 
         let quant = if config.quantization_config.is_some() {
-            Some(
-                config
-                    .quantization_config
-                    .as_ref()
-                    .unwrap()
-                    .quant_method
-                    .clone(),
-            )
+            None
         } else if isq.is_some() {
             panic!("DeepSeek does not support isq quantization yet!");
         } else {
@@ -173,7 +166,7 @@ impl DeepSeek {
             rope_theta: f64::from(config.rope_theta),
             rope_local_base_freq: None,
             bos_token_id: Some(config.bos_token_id),
-            eos_token_id: config.eos_token_id,
+            eos_token_id: Some(config.eos_token_id),
             max_seq_len: config.max_position_embeddings,
             sliding_window: config.sliding_window,
             sliding_window_pattern: None,
@@ -192,8 +185,9 @@ impl DeepSeek {
             final_logit_softcapping: None,
             quantization_config: config.quantization_config.clone(),
             moe_config: Some(MoEConfig::DeepSeekMoE(moe_config)),
-            quant,
+            isq_quant: quant,
             fp8_kvcache: None,
+            extra_config_json: None,
         };
         Ok(config)
     }
@@ -448,7 +442,7 @@ impl Attention {
                     lora_rank,
                     attention_bias,
                     vb.pp("q_a_proj"),
-                    &cfg.quant,
+                    &cfg.isq_quant,
                     &cfg.quantization_config,
                 )?;
                 let norm = rms_norm(lora_rank, cfg.rms_norm_eps, vb.pp("q_a_layernorm"))?;
@@ -458,7 +452,7 @@ impl Attention {
                     false,
                     vb.pp("q_b_proj"),
                     comm.clone(),
-                    &cfg.quant,
+                    &cfg.isq_quant,
                     &cfg.quantization_config,
                 )?;
                 QProj::Lora { a, norm, b }
@@ -469,7 +463,7 @@ impl Attention {
                 false,
                 vb.pp("q_proj"),
                 comm.clone(),
-                &cfg.quant,
+                &cfg.isq_quant,
                 &cfg.quantization_config,
             )?),
         };
@@ -479,7 +473,7 @@ impl Attention {
             moe_cfg.kv_lora_rank + moe_cfg.qk_rope_head_dim,
             attention_bias,
             vb.pp("kv_a_proj_with_mqa"),
-            &cfg.quant,
+            &cfg.isq_quant,
             &cfg.quantization_config,
         )?;
         let kv_a_layernorm = rms_norm(
@@ -493,7 +487,7 @@ impl Attention {
             false,
             vb.pp("kv_b_proj"),
             comm.clone(),
-            &cfg.quant,
+            &cfg.isq_quant,
             &cfg.quantization_config,
         )?;
 
@@ -503,7 +497,7 @@ impl Attention {
             attention_bias,
             vb.pp("o_proj"),
             comm.clone(),
-            &cfg.quant,
+            &cfg.isq_quant,
             &cfg.quantization_config,
         )?;
 
@@ -637,7 +631,7 @@ impl Mlp {
             hidden_size,
             intermediate_size,
             vb.pp("gate_proj"),
-            &cfg.quant,
+            &cfg.isq_quant,
             &cfg.quantization_config,
         )?;
 
@@ -645,7 +639,7 @@ impl Mlp {
             hidden_size,
             intermediate_size,
             vb.pp("up_proj"),
-            &cfg.quant,
+            &cfg.isq_quant,
             &cfg.quantization_config,
         )?;
 
@@ -653,7 +647,7 @@ impl Mlp {
             intermediate_size,
             hidden_size,
             vb.pp("down_proj"),
-            &cfg.quant,
+            &cfg.isq_quant,
             &cfg.quantization_config,
         )?;
 
