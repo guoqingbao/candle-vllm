@@ -421,15 +421,15 @@ impl DefaultLoader {
         block_size: usize,
         max_num_seqs: usize,
         device_ids: Vec<usize>, //pass only 1 device_id in multiprocess mode, otherwise, multiple device_ids in multithread mode
-        #[cfg(any(feature = "nccl", feature = "eccl"))] comm_id: Option<crate::openai::distributed::Id>, //must pass comm id in multiprocess mode
+        #[cfg(feature = "eccl")] comm_id: Option<crate::openai::distributed::Id>, //must pass comm id in multiprocess mode
         local_rank: Option<usize>, //must pass current rank in multiprocess mode
         local_world_size: Option<usize>, //must pass the number of local devices used in multiprocess mode
-        #[cfg(any(feature = "nccl", feature = "eccl"))] global_rank: Option<usize>, //must pass current global rank in multi-node mode
-        #[cfg(any(feature = "nccl", feature = "eccl"))] global_world_size: Option<usize>, //must pass total number of devices used in multi-node mode
+        #[cfg(feature = "eccl")] global_rank: Option<usize>, //must pass current global rank in multi-node mode
+        #[cfg(feature = "eccl")] global_world_size: Option<usize>, //must pass total number of devices used in multi-node mode
     ) -> Result<(Vec<Box<DefaultPipeline>>, PipelineConfig)> {
         let reporter = Arc::new(RwLock::new(ProgressReporter::new(local_rank.unwrap_or(0))));
         let num_subprogress = local_world_size.map_or(0, |n| n - 1);
-        #[cfg(any(feature = "nccl", feature = "eccl"))]
+        #[cfg(feature = "eccl")]
         let pipeline_num_shards = global_world_size
             .or(local_world_size)
             .unwrap_or(device_ids.len());
@@ -644,9 +644,6 @@ impl DefaultLoader {
                 config.apply_runtime_rope_overrides(self.yarn_scaling_factor);
             }
             let weight_filenames: Vec<PathBuf> = paths.get_weight_filenames();
-            let shared_vb = unsafe {
-                candle_nn::var_builder::ShardedSafeTensors::var_backend(&weight_filenames).unwrap()
-            };
             config.fp8_kvcache = Some(kv_cache_dtype == DType::U8);
             info!("Model {:?}", config);
 
@@ -659,13 +656,13 @@ impl DefaultLoader {
             .await;
 
             use crate::openai::distributed::Comm;
-            #[cfg(any(feature = "nccl", feature = "eccl"))]
+            #[cfg(feature = "eccl")]
             let id = if comm_id.is_some() {
                 comm_id.unwrap()
             } else {
                 crate::openai::distributed::Id::new().unwrap()
             };
-            #[cfg(any(feature = "nccl", feature = "eccl"))]
+            #[cfg(feature = "eccl")]
             assert!(
                 (comm_id.is_some() && device_ids.len() == 1)
                     || (comm_id.is_none() && device_ids.len() >= 1)
@@ -674,19 +671,18 @@ impl DefaultLoader {
                 .par_iter()
                 .enumerate()
                 .map(|(rank, dev_id)| {
-                    #[cfg(any(feature = "nccl", feature = "eccl"))]
+                    #[cfg(feature = "eccl")]
                     let rank = if global_rank.is_some() {
                         global_rank.unwrap()
                     } else {
                         rank
                     };
-                    #[cfg(any(feature = "nccl", feature = "eccl"))]
+                    #[cfg(feature = "eccl")]
                     let num_shards = if global_world_size.is_some() {
                         global_world_size.unwrap()
                     } else {
                         device_ids.len()
                     };
-
                     let device = crate::new_device(*dev_id).unwrap();
                     #[cfg(feature = "eccl")]
                     let _ = device.as_gcu_device().unwrap().bind_to_thread();
@@ -742,8 +738,8 @@ impl DefaultLoader {
                     let comm = Rc::new(Comm::default());
 
                     let vb = unsafe {
-                        candle_nn::var_builder::ShardedSafeTensors::from_backend(
-                            shared_vb.clone(),
+                        candle_nn::var_builder::ShardedSafeTensors::var_builder(
+                            &weight_filenames,
                             dtype,
                             &device,
                         )
@@ -1033,7 +1029,7 @@ impl DefaultLoader {
             generation_cfg,
         };
 
-        #[cfg(any(feature = "nccl", feature = "eccl"))]
+        #[cfg(feature = "eccl")]
         let global_rank = global_rank.unwrap_or(0);
         #[cfg(not(any(feature = "nccl", feature = "eccl")))]
         let global_rank = local_rank.unwrap_or(0);
@@ -1229,7 +1225,7 @@ impl DefaultLoader {
 
                 let model_display_name = if gguf {
                     match crate::backend::gguf::get_gguf_name(&paths.get_weight_filenames()[0]) {
-                        Ok(name) => Some(name),
+                        Ok(name) => name.or(public_model_name.clone()),
                         _ => public_model_name.clone(),
                     }
                 } else {
@@ -1268,7 +1264,6 @@ impl DefaultPipeline {
     fn output_contains_tool_call_start(&self, seq: &Arc<Sequence>) -> bool {
         if !self.tool_call_start_token_ids.is_empty() {
             return seq
-                .deref()
                 .get_output_tokens()
                 .iter()
                 .any(|logprob| self.tool_call_start_token_ids.contains(&logprob.token));
@@ -1278,7 +1273,7 @@ impl DefaultPipeline {
         }
 
         let mut generated = String::new();
-        for logprob in seq.deref().get_output_tokens() {
+        for logprob in seq.get_output_tokens() {
             generated.push_str(&logprob.bytes);
         }
         generated.contains(&self.tool_config.start_token_str)
@@ -1774,7 +1769,7 @@ impl DefaultPipeline {
                             top_logprobs: Vec::<TopLogprob>::new(),
                             bytes: text,
                         };
-                        seq.deref_mut().deref_mut().pending_finish_logprobs = Some(finish_logprobs);
+                        Sequence::deref_mut(seq).set_pending_finish_logprobs(Some(finish_logprobs));
                         return Right("tool_calls".to_string());
                     }
                     if self.is_nested_tool_call_start(seq, next_token, &text) {
@@ -1788,12 +1783,11 @@ impl DefaultPipeline {
                             top_logprobs: Vec::<TopLogprob>::new(),
                             bytes: text,
                         };
-                        seq.deref_mut().deref_mut().pending_finish_logprobs = Some(finish_logprobs);
+                        Sequence::deref_mut(seq).set_pending_finish_logprobs(Some(finish_logprobs));
                         return Right("tool_calls".to_string());
                     }
                     if self.json_end_token_id == Some(next_token) {
                         let mut output_tokens: Vec<u32> = seq
-                            .deref()
                             .get_output_tokens()
                             .iter()
                             .map(|logprob| logprob.token)
@@ -1807,8 +1801,7 @@ impl DefaultPipeline {
                                     top_logprobs: Vec::<TopLogprob>::new(),
                                     bytes: text,
                                 };
-                                seq.deref_mut().deref_mut().pending_finish_logprobs =
-                                    Some(finish_logprobs);
+                                Sequence::deref_mut(seq).set_pending_finish_logprobs(Some(finish_logprobs));
                                 return Right("tool_calls".to_string());
                             }
                         }

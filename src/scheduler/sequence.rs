@@ -263,6 +263,10 @@ impl _Sequence {
 }
 
 impl _Sequence {
+    pub fn set_pending_finish_logprobs(&self, logprobs: Option<Logprobs>) {
+        self.deref_mut().pending_finish_logprobs = logprobs;
+    }
+
     pub fn deref(&self) -> RwLockReadGuard<'_, SequenceData> {
         // loop {
         //     if let Ok(res) = self.data.try_lock() {
@@ -287,6 +291,19 @@ pub struct Sequence(pub RwLock<_Sequence>);
 impl Sequence {
     pub fn deref(&self) -> RwLockReadGuard<'_, _Sequence> {
         self.0.read().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Output token logprobs (forwards to inner [`_Sequence::get_output_tokens`]).
+    pub fn get_output_tokens(&self) -> Vec<Logprobs> {
+        self.deref().get_output_tokens()
+    }
+
+    pub fn set_pending_finish_logprobs(&self, logprobs: Option<Logprobs>) {
+        self.deref_mut().deref_mut().pending_finish_logprobs = logprobs;
+    }
+
+    pub fn get_finish_reason(&self) -> String {
+        self.deref().get_finish_reason()
     }
 
     pub fn deref_mut(&self) -> RwLockWriteGuard<'_, _Sequence> {

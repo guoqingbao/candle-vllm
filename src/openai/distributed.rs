@@ -1,17 +1,17 @@
 use super::models::linear::qlinear;
 use crate::openai::models::linear::{linear_no_bias_x as linear, Linear, LinearX, LnFp8};
-#[cfg(feature = "eccl")]
-pub use candle_core::gcu_backend::ubridge::eccl::{Comm, Id};
 #[cfg(all(feature = "nccl", not(feature = "eccl")))]
 pub use candle_core::cuda_backend::cudarc::nccl::safe::{Comm, Id};
+#[cfg(feature = "eccl")]
+pub use candle_core::gcu_backend::ubridge::eccl::{Comm, Id};
 use candle_core::{CpuStorage, Layout, Module, Result, Shape, Tensor};
 use candle_core::{CustomOp1, DType, Device};
 use candle_nn::var_builder::Shard;
 pub use candle_nn::var_builder::ShardedVarBuilder as VarBuilder;
 use candle_nn::{Embedding, LayerNorm, RmsNorm};
-#[cfg(all(not(feature = "eccl"), not(feature = "nccl")))]
+#[cfg(not(feature = "eccl"))]
 pub struct Comm {}
-#[cfg(all(not(feature = "eccl"), not(feature = "nccl")))]
+#[cfg(not(feature = "eccl"))]
 impl Comm {
     //dummy Comm
     pub fn default() -> Self {
@@ -29,7 +29,7 @@ impl Comm {
     }
 }
 
-#[cfg(all(not(feature = "eccl"), not(feature = "nccl")))]
+#[cfg(not(feature = "eccl"))]
 pub struct Id {}
 
 pub use std::rc::Rc;
@@ -439,7 +439,7 @@ impl CustomOp1 for AllReduce {
             DType::BF16 => {
                 let s = s.as_gcu_slice::<bf16>()?;
                 let s = match l.contiguous_offsets() {
-                    Some((0, l)) if l == s.len() => s,
+                    Some((0, off)) if off == elem_count => s,
                     Some(_) | None => candle::bail!("input has to be contiguous"),
                 };
                 let mut dst = dev.alloc::<bf16>(elem_count).w()?;
@@ -451,7 +451,7 @@ impl CustomOp1 for AllReduce {
             DType::F16 => {
                 let s = s.as_gcu_slice::<f16>()?;
                 let s = match l.contiguous_offsets() {
-                    Some((0, l)) if l == s.len() => s,
+                    Some((0, off)) if off == elem_count => s,
                     Some(_) | None => candle::bail!("input has to be contiguous"),
                 };
                 let mut dst = dev.alloc::<f16>(elem_count).w()?;
@@ -463,7 +463,7 @@ impl CustomOp1 for AllReduce {
             DType::F32 => {
                 let s = s.as_gcu_slice::<f32>()?;
                 let s = match l.contiguous_offsets() {
-                    Some((0, l)) if l == s.len() => s,
+                    Some((0, off)) if off == elem_count => s,
                     Some(_) | None => candle::bail!("input has to be contiguous"),
                 };
                 let mut dst = dev.alloc::<f32>(elem_count).w()?;
@@ -481,11 +481,11 @@ impl CustomOp1 for AllReduce {
 impl TensorParallelRowLinear {
     #[allow(unused_variables)]
     pub fn new(linear: LinearX, comm: Rc<Comm>) -> Self {
-        #[cfg(any(feature = "eccl", feature = "nccl"))]
+        #[cfg(feature = "eccl")]
         let all_reduce = AllReduce { comm };
         Self {
             linear,
-            #[cfg(any(feature = "eccl", feature = "nccl"))]
+            #[cfg(feature = "eccl")]
             all_reduce,
             bias: None,
         }
@@ -493,11 +493,11 @@ impl TensorParallelRowLinear {
 
     #[allow(unused_variables)]
     pub fn new_with_bias(linear: LinearX, bias: Option<Tensor>, comm: Rc<Comm>) -> Self {
-        #[cfg(any(feature = "eccl", feature = "nccl"))]
+        #[cfg(feature = "eccl")]
         let all_reduce = AllReduce { comm };
         Self {
             linear,
-            #[cfg(any(feature = "eccl", feature = "nccl"))]
+            #[cfg(feature = "eccl")]
             all_reduce,
             bias,
         }
@@ -505,7 +505,7 @@ impl TensorParallelRowLinear {
 
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let xs = self.linear.forward(x)?;
-        #[cfg(any(feature = "eccl", feature = "nccl"))]
+        #[cfg(feature = "eccl")]
         let xs = xs.apply_op1_no_bwd(&self.all_reduce)?;
 
         if let Some(bias) = &self.bias {

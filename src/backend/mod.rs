@@ -3,8 +3,6 @@ mod cache;
 pub mod gguf;
 #[cfg(not(feature = "gcu"))]
 pub mod gptq;
-#[cfg(feature = "gcu")]
-mod paged_attention;
 #[cfg(feature = "cuda")]
 pub fn get_or_load_func(
     ptx_file: &'static str,
@@ -48,8 +46,6 @@ use candle_core::{
 
 #[cfg(not(feature = "gcu"))]
 pub use gptq::*;
-#[cfg(feature = "gcu")]
-pub use paged_attention::*;
 pub use std::ops::Deref;
 pub mod custom_ops;
 #[cfg(feature = "eccl")]

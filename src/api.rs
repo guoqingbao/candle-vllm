@@ -210,13 +210,13 @@ impl EngineBuilder {
                 self.block_size,
                 self.max_num_seqs,
                 device_ids.clone(),
-                #[cfg(feature = "nccl")]
-                None, // Todo: Handle nccl
+                #[cfg(feature = "eccl")]
                 None,
                 None,
-                #[cfg(feature = "nccl")]
                 None,
-                #[cfg(feature = "nccl")]
+                #[cfg(feature = "eccl")]
+                None,
+                #[cfg(feature = "eccl")]
                 None,
             )
             .await?;
@@ -319,8 +319,8 @@ impl EngineBuilder {
             notify.clone(),
             holding_time,
             num_shards,
-            false, // multi_process: Assume false for simple API usage for now
-            #[cfg(feature = "nccl")]
+            false,
+            #[cfg(feature = "eccl")]
             None,
             self.prefill_chunk_size,
         )?;

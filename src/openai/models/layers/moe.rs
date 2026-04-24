@@ -2,9 +2,9 @@
 use crate::candle::quantized::QTensor;
 use crate::openai::distributed::{shard, AllReduce, Comm, VarBuilder};
 use crate::openai::models::linear::{linear_no_bias, Linear};
-use crate::openai::models::{Config, MoEConfig, QwenMoEConfig};
 #[cfg(not(feature = "gcu"))]
 use crate::openai::models::QuantConfig;
+use crate::openai::models::{Config, MoEConfig, QwenMoEConfig};
 use attention_rs::moe;
 #[cfg(not(feature = "gcu"))]
 use attention_rs::moe::moe_gemm_fp8;
@@ -342,73 +342,67 @@ impl FusedMoe {
             topk_weights = (topk_weights * routed_scaling_factor)?;
         }
 
-        let (expert_ids, sorted_token_ids) = if is_prefill {
-            #[cfg(feature = "cuda")]
-            {
-                use attention_rs::sort::ArgSortOp;
-                topk_ids.flatten_all()?.sort(true)?
-            }
-            #[cfg(not(feature = "cuda"))]
-            topk_ids.flatten_all()?.sort_last_dim(true)?
-        } else {
-            topk_ids.flatten_all()?.sort_last_dim(true)?
-        };
+        const MOE_BLOCK_SIZE: usize = 32;
 
-        #[cfg(feature = "gcu")]
-        let (gate, up) = {
-            let gate = moe::moe_gemm(
-                &xs,
-                &self.gate_w,
-                &None,
-                &sorted_token_ids,
-                &expert_ids,
-                self.num_experts_per_tok,
-                is_prefill,
-            )?;
-            let up = moe::moe_gemm(
-                &xs,
-                &self.up_w,
-                &None,
-                &sorted_token_ids,
-                &expert_ids,
-                self.num_experts_per_tok,
-                is_prefill,
-            )?;
-            (gate, up)
-        };
-        #[cfg(not(feature = "gcu"))]
-        let (gate, up) = {
-            let gate_up = moe::moe_gemm(
-                &xs,
-                &self.gate_up_w,
-                &None,
-                &sorted_token_ids,
-                &expert_ids,
-                self.num_experts_per_tok,
-                is_prefill,
-            )?;
-            let gate = gate_up
-                .narrow(candle_core::D::Minus1, 0, self.w_size_n)?
-                .contiguous()?;
-            let up = gate_up
-                .narrow(candle_core::D::Minus1, self.w_size_n, self.w_size_n)?
-                .contiguous()?;
-            (gate, up)
-        };
+        let (sorted_token_ids, expert_ids, num_tokens_post_pad) = moe::gcu_moe_align_block_size(
+            &topk_ids,
+            self.gate_w.dim(0)?,
+            MOE_BLOCK_SIZE,
+            num_tokens,
+            self.num_experts_per_tok,
+        )?;
+
+        let gate = moe::moe_gemm(
+            &xs,
+            &self.gate_w,
+            &None,
+            &sorted_token_ids,
+            &expert_ids,
+            &num_tokens_post_pad,
+            self.num_experts_per_tok,
+            MOE_BLOCK_SIZE,
+            num_tokens,
+        )?;
+
+        let up = moe::moe_gemm(
+            &xs,
+            &self.up_w,
+            &None,
+            &sorted_token_ids,
+            &expert_ids,
+            &num_tokens_post_pad,
+            self.num_experts_per_tok,
+            MOE_BLOCK_SIZE,
+            num_tokens,
+        )?;
+
 
         let down_inputs = (up * gate.apply(&self.act)?)?;
 
-        let mut ys = moe::moe_gemm(
-            &down_inputs,
-            &self.down_w,
-            &Some(topk_weights),
-            &sorted_token_ids,
-            &expert_ids,
-            self.num_experts_per_tok,
-            is_prefill,
-        )?
-        .reshape((num_tokens, (), hidden_dim))?
-        .sum(D::Minus2)?;
+        let mut ys = {
+            let down_topk_weights = Some(topk_weights.flatten_all()?);
+            moe::moe_gemm(
+                &down_inputs,
+                &self.down_w,
+                &down_topk_weights,
+                &sorted_token_ids,
+                &expert_ids,
+                &num_tokens_post_pad,
+                self.num_experts_per_tok,
+                MOE_BLOCK_SIZE,
+                num_tokens,
+            )?
+        };
+
+        ys = ys
+            .to_dtype(DType::F32)?
+            .reshape((num_tokens, self.num_experts_per_tok, hidden_dim))?
+            .transpose(1, 2)?
+            .contiguous()?
+            .reshape((num_tokens * hidden_dim, self.num_experts_per_tok))?
+            .sum(D::Minus1)?
+            .reshape((num_tokens, hidden_dim))?
+            .to_dtype(xs.dtype())?;
 
         if self.world_size > 1 {
             ys = self.all_reduce.apply(&ys)?;

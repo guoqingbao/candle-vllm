@@ -81,16 +81,45 @@ impl DefaultRotaryEmbedding {
         k: &Tensor,
         positions: &Tensor,
     ) -> Result<(Tensor, Tensor)> {
-        candle_nn::apply_rotary_emb_qkv(
-            q,
-            k,
+        let rank = q.rank();
+        let (q4, k4) = if rank == 3 {
+            let (seq_len, num_heads, head_dim) = q.dims3()?;
+            let (_, num_kv_heads, _) = k.dims3()?;
+            (
+                q.reshape((1, seq_len, num_heads, head_dim))?
+                    .transpose(1, 2)?,
+                // .contiguous()?,
+                k.reshape((1, seq_len, num_kv_heads, head_dim))?
+                    .transpose(1, 2)?,
+                // .contiguous()?,
+            )
+        } else {
+            (q.clone(), k.clone())
+        };
+        let (q_out, k_out) = candle_nn::apply_rotary_emb_qkv(
+            &q4,
+            &k4,
             &self.cos_sin,
             &self.sin,
             positions,
             self.rotary_dim.unwrap_or(0),
             true,
             self.is_gpt_neox,
-        )
+        )?;
+        if rank == 3 {
+            let (seq_len, num_heads, head_dim) = q.dims3()?;
+            let (_, num_kv_heads, _) = k.dims3()?;
+            Ok((
+                q_out
+                    .transpose(1, 2)?
+                    .reshape((seq_len, num_heads, head_dim))?,
+                k_out
+                    .transpose(1, 2)?
+                    .reshape((seq_len, num_kv_heads, head_dim))?,
+            ))
+        } else {
+            Ok((q_out, k_out))
+        }
     }
 
     #[cfg(not(feature = "gcu"))]
@@ -272,7 +301,12 @@ impl ScalingRotaryEmbedding {
                         }
                     }
                 } else if rope_type == "default" {
-                    Self(DefaultRotaryEmbedding::new(rope_elem_dtype, cfg, dev, is_gpt_neox)?)
+                    Self(DefaultRotaryEmbedding::new(
+                        rope_elem_dtype,
+                        cfg,
+                        dev,
+                        is_gpt_neox,
+                    )?)
                 } else if rope_type == "dynamic" {
                     let scaling_factor = if let Some(ScalingValue::Single(factor)) =
                         rope_scaling.get("alpha")

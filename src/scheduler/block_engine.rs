@@ -445,6 +445,10 @@ impl BlockEngine {
         self.prefix_cache.is_some()
     }
 
+    pub fn require_mamba_prefix_snapshots(&self) -> bool {
+        self.require_mamba_prefix_snapshots
+    }
+
     pub fn prefix_hash_for_sequence(
         &self,
         sequence: &Sequence,

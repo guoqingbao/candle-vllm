@@ -20,8 +20,6 @@
 use super::QuantConfig;
 #[cfg(not(feature = "gcu"))]
 use crate::backend::gptq::{gptq_matmul, marlin_weight_repack};
-#[cfg(feature = "gcu")]
-use candle_nn::{gptq_matmul, marlin_weight_repack};
 use crate::candle::Module;
 use crate::candle::{
     quantized::{gguf_file, QMatMul, QTensor},
@@ -31,6 +29,8 @@ use crate::openai::distributed::shard;
 use candle_core::quantized;
 pub use candle_nn::var_builder::Shard;
 pub use candle_nn::var_builder::ShardedVarBuilder as VarBuilder;
+#[cfg(feature = "gcu")]
+use candle_nn::{gptq_matmul, marlin_weight_repack};
 
 use std::cell::Cell;
 use std::sync::Arc;

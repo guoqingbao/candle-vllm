@@ -22,9 +22,6 @@ pub struct FlashInferKvParams {
     pub num_qo_heads: usize,
 }
 
-#[cfg(feature = "gcu")]
-pub mod paged_attention;
-
 pub fn get_dtype(dtype: Option<String>) -> candle::DType {
     let dtype = match dtype.as_deref() {
         Some("f16") => candle::DType::F16,

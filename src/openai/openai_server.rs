@@ -210,9 +210,9 @@ pub async fn chat_completions(
         }
     }
 
-    #[cfg(any(feature = "nccl", feature = "eccl"))]
+    #[cfg(feature = "eccl")]
     use crate::openai::communicator::DaemonManager;
-    #[cfg(any(feature = "nccl", feature = "eccl"))]
+    #[cfg(feature = "eccl")]
     if !DaemonManager::is_master_rank() {
         return ChatResponder::ModelError(APIError::from(
             "Daemon process unable to generate response, please request server port of the main process!",

@@ -172,26 +172,42 @@ impl Phi4RotaryEmbedding {
             let short_sin = (freqs_short.sin()? * scaling_factor)?;
             let short_cos = (freqs_short.cos()? * scaling_factor)?;
 
-            let normal_emb = DefaultRotaryEmbedding {
-                sin: short_sin.to_dtype(dtype)?,
-                cos: short_cos.to_dtype(dtype)?,
-                is_gpt_neox: true,
-                rotary_dim: if cfg.partial_rotary_factor.is_some() {
-                    Some(rotary_dim)
-                } else {
-                    None
-                },
+            let normal_emb = {
+                let cos = short_cos.to_dtype(dtype)?;
+                let sin = short_sin.to_dtype(dtype)?;
+                #[cfg(feature = "gcu")]
+                let cos_sin = Tensor::cat(&[&cos, &sin], candle::D::Minus1)?;
+                DefaultRotaryEmbedding {
+                    cos,
+                    sin,
+                    #[cfg(feature = "gcu")]
+                    cos_sin,
+                    is_gpt_neox: true,
+                    rotary_dim: if cfg.partial_rotary_factor.is_some() {
+                        Some(rotary_dim)
+                    } else {
+                        None
+                    },
+                }
             };
 
-            let long_emb = DefaultRotaryEmbedding {
-                sin: long_sin.to_dtype(dtype)?,
-                cos: long_cos.to_dtype(dtype)?,
-                is_gpt_neox: true,
-                rotary_dim: if cfg.partial_rotary_factor.is_some() {
-                    Some(rotary_dim)
-                } else {
-                    None
-                },
+            let long_emb = {
+                let cos = long_cos.to_dtype(dtype)?;
+                let sin = long_sin.to_dtype(dtype)?;
+                #[cfg(feature = "gcu")]
+                let cos_sin = Tensor::cat(&[&cos, &sin], candle::D::Minus1)?;
+                DefaultRotaryEmbedding {
+                    cos,
+                    sin,
+                    #[cfg(feature = "gcu")]
+                    cos_sin,
+                    is_gpt_neox: true,
+                    rotary_dim: if cfg.partial_rotary_factor.is_some() {
+                        Some(rotary_dim)
+                    } else {
+                        None
+                    },
+                }
             };
 
             return Ok(Self {
@@ -204,15 +220,23 @@ impl Phi4RotaryEmbedding {
         let inv_freq = Tensor::from_vec(inv_freq, (1, inv_freq_len), dev)?.to_dtype(DType::F32)?;
         let freqs = t.matmul(&inv_freq)?;
 
-        let normal_emb = DefaultRotaryEmbedding {
-            cos: freqs.cos()?.to_dtype(dtype)?,
-            sin: freqs.sin()?.to_dtype(dtype)?,
-            is_gpt_neox: true,
-            rotary_dim: if cfg.partial_rotary_factor.is_some() {
-                Some(rotary_dim)
-            } else {
-                None
-            },
+        let normal_emb = {
+            let cos = freqs.cos()?.to_dtype(dtype)?;
+            let sin = freqs.sin()?.to_dtype(dtype)?;
+            #[cfg(feature = "gcu")]
+            let cos_sin = Tensor::cat(&[&cos, &sin], candle::D::Minus1)?;
+            DefaultRotaryEmbedding {
+                cos,
+                sin,
+                #[cfg(feature = "gcu")]
+                cos_sin,
+                is_gpt_neox: true,
+                rotary_dim: if cfg.partial_rotary_factor.is_some() {
+                    Some(rotary_dim)
+                } else {
+                    None
+                },
+            }
         };
 
         Ok(Self {

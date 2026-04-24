@@ -276,6 +276,10 @@ impl Scheduler {
         self.block_engine.prefix_cache_enabled()
     }
 
+    pub fn require_mamba_prefix_snapshots(&self) -> bool {
+        self.block_engine.require_mamba_prefix_snapshots()
+    }
+
     pub fn print_free_blocks(&self) {
         let free_blocks = self.block_engine.get_num_free_blocks();
         let num_blocks = self.block_engine.get_num_blocks();

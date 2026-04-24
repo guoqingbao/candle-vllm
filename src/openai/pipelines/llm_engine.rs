@@ -1,7 +1,7 @@
 use super::DefaultPipeline;
 #[path = "inputs.rs"]
 mod inputs;
-#[cfg(any(feature = "nccl", feature = "eccl"))]
+#[cfg(feature = "eccl")]
 #[path = "multiprocess.rs"]
 mod multiprocess;
 #[path = "streaming.rs"]
@@ -9,7 +9,7 @@ mod streaming;
 #[path = "threaded.rs"]
 mod threaded;
 
-#[cfg(any(feature = "nccl", feature = "eccl"))]
+#[cfg(feature = "eccl")]
 use crate::openai::communicator::DaemonManager;
 use crate::openai::pipelines::TokenOrFinishReason;
 use crate::openai::streaming::ChatResponse;
@@ -45,9 +45,9 @@ use candle_core::{Result, Tensor};
 use either::Either;
 use flume::Sender;
 use parking_lot::RwLock;
-#[cfg(any(feature = "nccl", feature = "eccl"))]
+#[cfg(feature = "eccl")]
 use rayon::iter::IntoParallelRefIterator;
-#[cfg(any(feature = "nccl", feature = "eccl"))]
+#[cfg(feature = "eccl")]
 use rayon::iter::ParallelIterator;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -98,7 +98,7 @@ pub struct LLMEngine {
     multi_process: bool,
     num_shards: usize,
     waiting_tasks: RwLock<Vec<TaskData>>,
-    #[cfg(any(feature = "nccl", feature = "eccl"))]
+    #[cfg(feature = "eccl")]
     pub daemon_manager: RwLock<Option<DaemonManager>>,
     prefill_chunk_size: Option<usize>,
     pub exit_flag: Arc<AtomicBool>,
@@ -107,7 +107,7 @@ pub struct LLMEngine {
 }
 
 impl LLMEngine {
-    #[cfg(any(feature = "nccl", feature = "eccl"))]
+    #[cfg(feature = "eccl")]
     pub(crate) fn planned_prompt_cache_statuses(
         &mut self,
         scheduled: &VecDeque<Arc<SequenceGroup>>,
@@ -115,6 +115,20 @@ impl LLMEngine {
     ) -> Result<Vec<(usize, usize, bool)>> {
         if scheduled.is_empty() || !Self::primary_sequence(&scheduled[0]).deref().is_prompt() {
             return Ok(Vec::new());
+        }
+
+        let needs_mamba = self.scheduler.require_mamba_prefix_snapshots();
+
+        if !needs_mamba {
+            let mut statuses = Vec::new();
+            for group in scheduled {
+                for seq in Self::ordered_group_sequences(group) {
+                    let seq_id = seq.deref().get_id();
+                    let cached_tokens = seq.deref().get_num_cached_tokens();
+                    statuses.push((seq_id, cached_tokens, true));
+                }
+            }
+            return Ok(statuses);
         }
 
         let restore_plans = self.scheduler.prepare_prompt_mamba_restores(scheduled);
@@ -161,7 +175,7 @@ impl LLMEngine {
         Ok(statuses)
     }
 
-    #[cfg(any(feature = "nccl", feature = "eccl"))]
+    #[cfg(feature = "eccl")]
     pub(crate) fn apply_prompt_mamba_targets(
         &mut self,
         groups: &VecDeque<Arc<SequenceGroup>>,
@@ -289,7 +303,7 @@ impl LLMEngine {
         )
     }
 
-    #[cfg(any(feature = "nccl", feature = "eccl"))]
+    #[cfg(feature = "eccl")]
     fn primary_sequence_id(group: &Arc<SequenceGroup>) -> usize {
         Self::primary_sequence(group).deref().get_id()
     }
@@ -502,7 +516,7 @@ impl LLMEngine {
         prompt_finish_times: &HashMap<usize, SystemTime>,
         _rank: usize,
     ) {
-        #[cfg(any(feature = "nccl", feature = "eccl"))]
+        #[cfg(feature = "eccl")]
         let do_log = DaemonManager::is_master_rank();
         #[cfg(not(any(feature = "nccl", feature = "eccl")))]
         let do_log = true;
@@ -572,7 +586,7 @@ impl LLMEngine {
         ranks: Vec<usize>,
         multi_process: bool,
     ) -> Vec<HashMap<String, (Vec<ChatChoice>, ChatCompletionUsageResponse)>> {
-        #[cfg(any(feature = "nccl", feature = "eccl"))]
+        #[cfg(feature = "eccl")]
         let iterator = ranks.par_iter();
         #[cfg(not(any(feature = "nccl", feature = "eccl")))]
         let iterator = ranks.iter();
@@ -622,9 +636,9 @@ impl LLMEngine {
     #[cfg(all(feature = "gcu", feature = "graph"))]
     pub fn graph_capture(engine: &Arc<RwLock<LLMEngine>>) -> Result<()> {
         let mut e = engine.write();
-        let (pipeline, cache_engine) = e.get_mut_pipeline(0usize).ok_or_else(|| {
-            candle_core::Error::msg("missing pipeline for rank 0")
-        })?;
+        let (pipeline, cache_engine) = e
+            .get_mut_pipeline(0usize)
+            .ok_or_else(|| candle_core::Error::msg("missing pipeline for rank 0"))?;
         pipeline.warmup_capture(Some(&cache_engine.get_kv_cache()))
     }
 
@@ -637,7 +651,7 @@ impl LLMEngine {
         holding_time: usize,
         num_shards: usize,
         multi_process: bool,
-        #[cfg(any(feature = "nccl", feature = "eccl"))] daemon_manager: Option<DaemonManager>,
+        #[cfg(feature = "eccl")] daemon_manager: Option<DaemonManager>,
         prefill_chunk_size: Option<usize>,
     ) -> Result<Arc<RwLock<Self>>> {
         const MIN_MAMBA_SLOT_CAPACITY: usize = 16;
@@ -780,7 +794,7 @@ impl LLMEngine {
             multi_process,
             num_shards,
             waiting_tasks: RwLock::new(Vec::<TaskData>::new()),
-            #[cfg(any(feature = "nccl", feature = "eccl"))]
+            #[cfg(feature = "eccl")]
             daemon_manager: RwLock::new(daemon_manager),
             sync_notifies: HashMap::new(),
             senders: HashMap::new(),
@@ -800,7 +814,7 @@ impl LLMEngine {
             ranks.push(rank);
         }
 
-        #[cfg(any(feature = "nccl", feature = "eccl"))]
+        #[cfg(feature = "eccl")]
         let is_master_rank = DaemonManager::is_master_rank();
         #[cfg(not(any(feature = "nccl", feature = "eccl")))]
         let is_master_rank = true;
@@ -856,7 +870,7 @@ impl LLMEngine {
                     }
                     {
                         let should_continue = if multi_process {
-                            #[cfg(any(feature = "nccl", feature = "eccl"))]
+                            #[cfg(feature = "eccl")]
                             {
                                 Self::sync_multiprocess_waiting_tasks_before_cycle(&engine)
                             }
@@ -875,7 +889,7 @@ impl LLMEngine {
 
                     let results = Self::generate_parallel(&engine, ranks.clone(), multi_process).await;
 
-                    #[cfg(any(feature = "nccl", feature = "eccl"))]
+                    #[cfg(feature = "eccl")]
                     if multi_process && !is_master_rank {
                         continue;
                     }
@@ -1246,7 +1260,7 @@ impl LLMEngine {
         multi_process: bool,
     ) -> Result<HashMap<String, (Vec<ChatChoice>, ChatCompletionUsageResponse)>> {
         if multi_process {
-            #[cfg(any(feature = "nccl", feature = "eccl"))]
+            #[cfg(feature = "eccl")]
             {
                 return Self::generate_once_multiprocess(engine, rank);
             }
@@ -1581,7 +1595,7 @@ impl LLMEngine {
                         let prompt_finish_time = SystemTime::now();
                         prompt_finish_times.insert(*group.get_id(), prompt_finish_time);
 
-                        #[cfg(any(feature = "nccl", feature = "eccl"))]
+                        #[cfg(feature = "eccl")]
                         let do_log = DaemonManager::is_master_rank();
                         #[cfg(not(any(feature = "nccl", feature = "eccl")))]
                         let do_log = true;
@@ -1682,7 +1696,7 @@ impl LLMEngine {
                     .as_millis();
                 let seq = Self::primary_sequence(group);
                 let decoded_tokens = seq.deref().get_len() - seq.deref().get_prompt_len();
-                #[cfg(any(feature = "nccl", feature = "eccl"))]
+                #[cfg(feature = "eccl")]
                 let do_log = DaemonManager::is_master_rank();
                 #[cfg(not(any(feature = "nccl", feature = "eccl")))]
                 let do_log = true;
@@ -1716,9 +1730,9 @@ impl LLMEngine {
                 if do_sync_response {
                     let pipeline = self.get_pipeline(0usize).unwrap().0.as_ref();
                     for (index, seq) in top_n.iter().enumerate() {
-                        let outputs = seq.deref_mut().get_output_tokens();
+                        let outputs = seq.get_output_tokens();
                         let should_parse_tools = group.sampling_params.mcp_mode.is_some();
-                        let mut finish_reason = seq.deref_mut().get_finish_reason().clone();
+                        let mut finish_reason = seq.get_finish_reason().clone();
 
                         let (content, tool_calls, full_accumulated) = if should_parse_tools {
                             let mut parser = StreamToolParser::new_with_config(
@@ -1961,7 +1975,7 @@ impl LLMEngine {
                 }
 
                 if let Some(sender) = &group.sender {
-                    if seq.deref().get_finish_reason() != "abort" {
+                    if seq.get_finish_reason() != "abort" {
                         debug!(
                             "Sending completion message to client! (sequence id {})",
                             seq.deref().get_id()
@@ -2068,7 +2082,7 @@ impl LLMEngine {
             self.senders.insert(request_id.clone(), Some(sender));
         }
 
-        #[cfg(any(feature = "nccl", feature = "eccl"))]
+        #[cfg(feature = "eccl")]
         let do_log = DaemonManager::is_master_rank();
         #[cfg(not(any(feature = "nccl", feature = "eccl")))]
         let do_log = true;
