@@ -236,21 +236,8 @@ impl DecoderLayer {
         // Qwen3.5 MoE / Qwen3-Next are routed-MoE layers; keep model path aligned
         // with upstream and avoid dense-MLP fallback in these architectures.
         let mlp = if is_fp8_model {
-            if let Some(ref quant_cfg) = cfg.quantization_config {
-                #[cfg(feature = "gcu")]
-                {
-                    candle::bail!("FP8 MoE is not supported on GCU; use a non-fp8 checkpoint or build without the gcu feature")
-                }
-                #[cfg(not(feature = "gcu"))]
-                {
-                    MoeOrMlp::FusedMoeFp8(FusedMoeFp8::new(
-                        cfg,
-                        vb.pp("mlp").clone(),
-                        comm.clone(),
-                        dtype,
-                        quant_cfg,
-                    )?)
-                }
+            if let Some(ref _quant_cfg) = cfg.quantization_config {
+                candle::bail!("FP8 MoE is not supported on GCU; use a non-fp8 checkpoint or build without the gcu feature")
             } else {
                 candle_core::bail!("Missing quantization_config for fp8 model!")
             }

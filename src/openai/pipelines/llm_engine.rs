@@ -518,7 +518,7 @@ impl LLMEngine {
     ) {
         #[cfg(feature = "eccl")]
         let do_log = DaemonManager::is_master_rank();
-        #[cfg(not(any(feature = "nccl", feature = "eccl")))]
+        #[cfg(not(feature = "eccl"))]
         let do_log = true;
         if !do_log || groups.is_empty() {
             return;
@@ -588,7 +588,7 @@ impl LLMEngine {
     ) -> Vec<HashMap<String, (Vec<ChatChoice>, ChatCompletionUsageResponse)>> {
         #[cfg(feature = "eccl")]
         let iterator = ranks.par_iter();
-        #[cfg(not(any(feature = "nccl", feature = "eccl")))]
+        #[cfg(not(feature = "eccl"))]
         let iterator = ranks.iter();
 
         let tasks: Vec<_> = iterator
@@ -639,7 +639,8 @@ impl LLMEngine {
         let (pipeline, cache_engine) = e
             .get_mut_pipeline(0usize)
             .ok_or_else(|| candle_core::Error::msg("missing pipeline for rank 0"))?;
-        pipeline.warmup_capture(Some(&cache_engine.get_kv_cache()))
+        let x = pipeline.warmup_capture(Some(&cache_engine.get_kv_cache()));
+        x
     }
 
     pub fn new(
@@ -816,31 +817,13 @@ impl LLMEngine {
 
         #[cfg(feature = "eccl")]
         let is_master_rank = DaemonManager::is_master_rank();
-        #[cfg(not(any(feature = "nccl", feature = "eccl")))]
+        #[cfg(not(feature = "eccl"))]
         let is_master_rank = true;
-        #[cfg(all(feature = "cuda", feature = "graph"))]
-        let (graph_capture_tx, graph_capture_rx) = std::sync::mpsc::sync_channel(1);
         #[cfg(all(feature = "gcu", feature = "graph"))]
         let (graph_capture_gcu_tx, graph_capture_gcu_rx) = std::sync::mpsc::sync_channel(1);
 
         let _ = tokio::task::spawn_blocking(move || {
             tokio::runtime::Handle::current().block_on(async move {
-                #[cfg(all(feature = "cuda", feature = "graph"))]
-                {
-                    let graph_capture_result = {
-                        let mut e = engine.write();
-                        e.graph_capture_all_pipelines()
-                    };
-                    let _ = graph_capture_tx.send(
-                        graph_capture_result
-                            .as_ref()
-                            .map(|_| ())
-                            .map_err(|e| format!("{e:?}")),
-                    );
-                    if graph_capture_result.is_err() {
-                        return;
-                    }
-                }
                 #[cfg(all(feature = "gcu", feature = "graph"))]
                 {
                     let graph_capture_result = {
@@ -874,7 +857,7 @@ impl LLMEngine {
                             {
                                 Self::sync_multiprocess_waiting_tasks_before_cycle(&engine)
                             }
-                            #[cfg(not(any(feature = "nccl", feature = "eccl")))]
+                            #[cfg(not(feature = "eccl"))]
                             {
                                 false
                             }
@@ -947,15 +930,6 @@ impl LLMEngine {
             });
         });
 
-        #[cfg(all(feature = "cuda", feature = "graph"))]
-        match graph_capture_rx.recv() {
-            Ok(Ok(())) => {}
-            Ok(Err(err)) => candle_core::bail!("Unable to capture cuda graph {err}!"),
-            Err(err) => candle_core::bail!(
-                "Failed to receive cuda graph warmup result from engine worker thread: {}",
-                err
-            ),
-        }
         #[cfg(all(feature = "gcu", feature = "graph"))]
         match graph_capture_gcu_rx.recv() {
             Ok(Ok(())) => {}
@@ -1597,7 +1571,7 @@ impl LLMEngine {
 
                         #[cfg(feature = "eccl")]
                         let do_log = DaemonManager::is_master_rank();
-                        #[cfg(not(any(feature = "nccl", feature = "eccl")))]
+                        #[cfg(not(feature = "eccl"))]
                         let do_log = true;
                         if do_log {
                             let prompt_time_costs = prompt_finish_time
@@ -1698,7 +1672,7 @@ impl LLMEngine {
                 let decoded_tokens = seq.deref().get_len() - seq.deref().get_prompt_len();
                 #[cfg(feature = "eccl")]
                 let do_log = DaemonManager::is_master_rank();
-                #[cfg(not(any(feature = "nccl", feature = "eccl")))]
+                #[cfg(not(feature = "eccl"))]
                 let do_log = true;
                 if do_log {
                     warn!(
@@ -2084,7 +2058,7 @@ impl LLMEngine {
 
         #[cfg(feature = "eccl")]
         let do_log = DaemonManager::is_master_rank();
-        #[cfg(not(any(feature = "nccl", feature = "eccl")))]
+        #[cfg(not(feature = "eccl"))]
         let do_log = true;
         if do_log {
             warn!(

@@ -1,7 +1,7 @@
 use crate::openai::models::{Config, ScalingValue};
 #[cfg(not(feature = "gcu"))]
 use attention_rs::fused_rope::FusedRope;
-use candle::{DType, Device, Result, Tensor, D};
+use candle::{DType, Device, Result, Tensor};
 use candle_core as candle;
 pub use std::rc::Rc;
 #[derive(Debug, Clone)]
@@ -40,7 +40,7 @@ fn calculate_default_inv_freq(base: f64, dim: usize) -> Vec<f32> {
 }
 
 impl DefaultRotaryEmbedding {
-    pub fn new(dtype: DType, cfg: &Config, device: &Device, is_gpt_neox: bool) -> Result<Self> {
+    pub fn new(_dtype: DType, cfg: &Config, device: &Device, is_gpt_neox: bool) -> Result<Self> {
         let dim = cfg
             .head_dim
             .unwrap_or(cfg.hidden_size / cfg.num_attention_heads);
@@ -179,7 +179,7 @@ impl DefaultRotaryEmbedding {
 pub struct ScalingRotaryEmbedding(pub DefaultRotaryEmbedding);
 
 impl ScalingRotaryEmbedding {
-    pub fn new(dtype: DType, cfg: &Config, dev: &Device, is_gpt_neox: bool) -> Result<Self> {
+    pub fn new(_dtype: DType, cfg: &Config, dev: &Device, is_gpt_neox: bool) -> Result<Self> {
         let dim = cfg
             .head_dim
             .unwrap_or(cfg.hidden_size / cfg.num_attention_heads);

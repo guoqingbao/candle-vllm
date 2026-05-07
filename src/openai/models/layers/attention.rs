@@ -22,6 +22,7 @@ enum QkvProjection {
     Packed(MergedParallelColumnLinear),
 }
 
+#[allow(unused)]
 pub struct Attention {
     qkv_proj: QkvProjection,
     o_proj: TensorParallelRowLinear,

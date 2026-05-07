@@ -325,7 +325,7 @@ impl FusedMoe {
         })
     }
 
-    pub fn forward(&self, xs: &Tensor, is_prefill: bool) -> Result<Tensor> {
+    pub fn forward(&self, xs: &Tensor, _is_prefill: bool) -> Result<Tensor> {
         let (num_tokens, hidden_dim) = xs.dims2()?;
         let router_logits = self.gate.forward(&xs)?;
 
@@ -375,7 +375,6 @@ impl FusedMoe {
             MOE_BLOCK_SIZE,
             num_tokens,
         )?;
-
 
         let down_inputs = (up * gate.apply(&self.act)?)?;
 

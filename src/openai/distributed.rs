@@ -1,7 +1,5 @@
 use super::models::linear::qlinear;
 use crate::openai::models::linear::{linear_no_bias_x as linear, Linear, LinearX, LnFp8};
-#[cfg(all(feature = "nccl", not(feature = "eccl")))]
-pub use candle_core::cuda_backend::cudarc::nccl::safe::{Comm, Id};
 #[cfg(feature = "eccl")]
 pub use candle_core::gcu_backend::ubridge::eccl::{Comm, Id};
 use candle_core::{CpuStorage, Layout, Module, Result, Shape, Tensor};
@@ -341,7 +339,7 @@ impl MergedParallelColumnLinear {
 
 pub struct TensorParallelRowLinear {
     linear: LinearX,
-    #[cfg(any(feature = "eccl", feature = "nccl"))]
+    #[cfg(feature = "eccl")]
     all_reduce: AllReduce,
     bias: Option<Tensor>,
 }
@@ -373,51 +371,6 @@ impl CustomOp1 for AllReduce {
 
     fn cpu_fwd(&self, _s: &CpuStorage, _l: &Layout) -> Result<(CpuStorage, Shape)> {
         candle_core::bail!("AllReduce is never used on cpu")
-    }
-
-    #[cfg(all(feature = "cuda", feature = "nccl"))]
-    fn cuda_fwd(
-        &self,
-        s: &candle_core::CudaStorage,
-        l: &Layout,
-    ) -> Result<(candle_core::CudaStorage, Shape)> {
-        use candle_core::backend::BackendStorage;
-        use candle_core::cuda_backend::cudarc::nccl::safe::ReduceOp;
-        use candle_core::cuda_backend::WrapErr;
-        use candle_core::DType;
-        use half::{bf16, f16};
-
-        if !l.is_contiguous() {
-            candle_core::bail!("Inputs for all_reduce must be contiguous!");
-        }
-        let elem_count = l.shape().elem_count();
-        let dev = s.device().clone();
-        let start_offset = l.start_offset();
-
-        let dst = match s.dtype() {
-            DType::BF16 => {
-                let full_slice = s.as_cuda_slice::<bf16>()?;
-                // Slice to only the valid elements (handles narrow/view tensors)
-                let src_slice = full_slice.slice(start_offset..start_offset + elem_count);
-                let mut dst = unsafe { dev.alloc::<bf16>(elem_count) }.w()?;
-                self.comm
-                    .all_reduce(&src_slice, &mut dst, &ReduceOp::Sum)
-                    .map_err(candle_core::Error::debug)?;
-                candle_core::CudaStorage::wrap_cuda_slice(dst, dev)
-            }
-            DType::F16 => {
-                let full_slice = s.as_cuda_slice::<f16>()?;
-                // Slice to only the valid elements (handles narrow/view tensors)
-                let src_slice = full_slice.slice(start_offset..start_offset + elem_count);
-                let mut dst = unsafe { dev.alloc::<f16>(elem_count) }.w()?;
-                self.comm
-                    .all_reduce(&src_slice, &mut dst, &ReduceOp::Sum)
-                    .map_err(candle_core::Error::debug)?;
-                candle_core::CudaStorage::wrap_cuda_slice(dst, dev)
-            }
-            dtype => candle_core::bail!("unsupported dtype {dtype:?}"),
-        };
-        Ok((dst, l.shape().clone()))
     }
 
     #[cfg(all(feature = "gcu", feature = "eccl"))]

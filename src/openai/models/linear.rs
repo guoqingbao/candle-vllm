@@ -34,7 +34,6 @@ use candle_nn::{gptq_matmul, marlin_weight_repack};
 
 use std::cell::Cell;
 use std::sync::Arc;
-use tracing::warn;
 
 thread_local! {
     static FP8_LINEAR_IS_PREFILL: Cell<bool> = const { Cell::new(false) };
@@ -345,7 +344,7 @@ pub fn qlinear(
                     //only model with 4-bit and desc_act==false can be repacked to marlin format
                     #[cfg(not(feature = "gcu"))]
                     if cfg.quant_method == "marlin" {
-                        warn!("The current GPTQ model does no compatible with marlin format because one of the following conditions: !cfg.sym || cfg.bits != 4 || (cfg.group_size != 128 && cfg.group_size != -1) || (cfg.desc_act == true)");
+                        tracing::warn!("The current GPTQ model does no compatible with marlin format because one of the following conditions: !cfg.sym || cfg.bits != 4 || (cfg.group_size != 128 && cfg.group_size != -1) || (cfg.desc_act == true)");
                     }
                     //conventional gptq format
                     Ok(Linear {
@@ -758,41 +757,21 @@ impl Module for QLinear {
             (QMatMul::Tensor(qw), Some(scale), qzeros, g_idx, workspace) => {
                 //gptq (only f16/bf16 inputs for marlin format)
                 let x = match *x.dims() {
-                    [bsize, seq_len, dim1, dim2] => {
-                        #[cfg(feature = "gcu")]
-                        {
-                            let qw = &qw.broadcast_left((bsize, seq_len))?.t()?;
-                            gptq_matmul(
-                                x,
-                                qw,
-                                scale,
-                                qzeros,
-                                g_idx,
-                                workspace,
-                                self.bits,
-                                self.group_size,
-                                self.is_awq,
-                            )?
-                        }
-                        #[cfg(not(feature = "gcu"))]
-                        {
-                            let x = x.reshape((bsize * seq_len, dim1, dim2))?;
-                            let o = gptq_matmul(
-                                &x,
-                                qw,
-                                scale,
-                                qzeros,
-                                g_idx,
-                                workspace,
-                                self.bits,
-                                self.group_size,
-                                self.is_awq,
-                            )?;
-                            o.reshape((bsize, seq_len, dim1, ()))?
-                        }
+                    [bsize, seq_len, _, _] => {
+                        let qw = &qw.broadcast_left((bsize, seq_len))?.t()?;
+                        gptq_matmul(
+                            x,
+                            qw,
+                            scale,
+                            qzeros,
+                            g_idx,
+                            workspace,
+                            self.bits,
+                            self.group_size,
+                            self.is_awq,
+                        )?
                     }
                     [bsize, _, _] => {
-                        #[cfg(feature = "gcu")]
                         let qw = &qw.broadcast_left(bsize)?.t()?;
                         gptq_matmul(
                             x,
@@ -806,38 +785,19 @@ impl Module for QLinear {
                             self.is_awq,
                         )?
                     }
-                    [seq_len, dim] => {
-                        #[cfg(feature = "gcu")]
-                        {
-                            let qw = &qw.t()?;
-                            gptq_matmul(
-                                x,
-                                qw,
-                                scale,
-                                qzeros,
-                                g_idx,
-                                workspace,
-                                self.bits,
-                                self.group_size,
-                                self.is_awq,
-                            )?
-                        }
-                        #[cfg(not(feature = "gcu"))]
-                        {
-                            let x = x.reshape((1, seq_len, dim))?;
-                            let o = gptq_matmul(
-                                &x,
-                                qw,
-                                scale,
-                                qzeros,
-                                g_idx,
-                                workspace,
-                                self.bits,
-                                self.group_size,
-                                self.is_awq,
-                            )?;
-                            o.reshape((seq_len, ()))?
-                        }
+                    [_, _] => {
+                        let qw = &qw.t()?;
+                        gptq_matmul(
+                            x,
+                            qw,
+                            scale,
+                            qzeros,
+                            g_idx,
+                            workspace,
+                            self.bits,
+                            self.group_size,
+                            self.is_awq,
+                        )?
                     }
                     _ => panic!("Invalid input format!"),
                 };

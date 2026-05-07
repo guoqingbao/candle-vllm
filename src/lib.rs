@@ -100,6 +100,7 @@ lazy_static! {
 }
 
 //Avoid new_device in parallel
+#[allow(unreachable_code)]
 pub fn new_device(ordinal: usize) -> Result<Device> {
     let _guard = GLOBAL_LOCK.lock().unwrap(); // Acquire the lock
     if cuda_is_available() {

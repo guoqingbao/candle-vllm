@@ -42,6 +42,7 @@ use rayon::prelude::*;
 use regex::Regex;
 use std::collections::HashMap;
 use std::collections::VecDeque;
+#[allow(unused)]
 use std::ops::{Deref, DerefMut};
 use std::path::Path;
 pub use std::rc::Rc;
@@ -433,7 +434,7 @@ impl DefaultLoader {
         let pipeline_num_shards = global_world_size
             .or(local_world_size)
             .unwrap_or(device_ids.len());
-        #[cfg(not(any(feature = "nccl", feature = "eccl")))]
+        #[cfg(not(feature = "eccl"))]
         let pipeline_num_shards = local_world_size.unwrap_or(device_ids.len());
         let _guard = candle_core::InferenceMode::enter();
         let (models, devices, config, sep_style) = if gguf {
@@ -687,20 +688,9 @@ impl DefaultLoader {
                     #[cfg(feature = "eccl")]
                     let _ = device.as_gcu_device().unwrap().bind_to_thread();
 
-                    #[cfg(all(feature = "nccl", not(feature = "eccl")))]
-                    let _ = device.as_cuda_device().unwrap().bind_to_thread();
-
                     #[cfg(feature = "eccl")]
                     tracing::warn!(
                         "create eccl comm channel rank {}, shards {}, id {:?}",
-                        rank,
-                        num_shards,
-                        id
-                    );
-
-                    #[cfg(all(feature = "nccl", not(feature = "eccl")))]
-                    tracing::warn!(
-                        "create nccl comm channel rank {}, shards {}, id {:?}",
                         rank,
                         num_shards,
                         id
@@ -717,24 +707,10 @@ impl DefaultLoader {
                         .unwrap(),
                     );
 
-                    #[cfg(all(feature = "nccl", not(feature = "eccl")))]
-                    let comm = Rc::new(
-                        Comm::from_rank(
-                            device.as_cuda_device().unwrap().cuda_device(),
-                            rank,
-                            num_shards,
-                            id,
-                        )
-                        .unwrap(),
-                    );
-
                     #[cfg(feature = "eccl")]
                     tracing::warn!("eccl comm created for rank {}", rank);
 
-                    #[cfg(all(feature = "nccl", not(feature = "eccl")))]
-                    tracing::warn!("nccl comm created for rank {}", rank);
-
-                    #[cfg(not(any(feature = "nccl", feature = "eccl")))]
+                    #[cfg(not(feature = "eccl"))]
                     let comm = Rc::new(Comm::default());
 
                     let vb = unsafe {
@@ -1031,7 +1007,7 @@ impl DefaultLoader {
 
         #[cfg(feature = "eccl")]
         let global_rank = global_rank.unwrap_or(0);
-        #[cfg(not(any(feature = "nccl", feature = "eccl")))]
+        #[cfg(not(feature = "eccl"))]
         let global_rank = local_rank.unwrap_or(0);
 
         let public_model_name = self.public_model_name();

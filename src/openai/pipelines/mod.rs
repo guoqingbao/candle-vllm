@@ -50,7 +50,7 @@ macro_rules! graph_model_wrapper {
                     model_arc.forward(input_ids, positions, kv_caches, input_metadata, None)
                 };
                 let boxed_closure: Box<ModelFn> = Box::new(closure);
-                CudaGraphWrapper::new(boxed_closure, $device.as_cuda_device()?.clone().into())
+                CudaGraphWrapper::new(boxed_closure, $device.as_gcu_device()?.clone().into())
             },
             LLMModel::Gemma3VL(m) => {
                 let model_arc = Arc::clone(&m);
@@ -65,7 +65,7 @@ macro_rules! graph_model_wrapper {
                     model_arc.forward(input_ids, positions, kv_caches, input_metadata, None)
                 };
                 let boxed_closure: Box<ModelFn> = Box::new(closure);
-                CudaGraphWrapper::new(boxed_closure, $device.as_cuda_device()?.clone().into())
+                CudaGraphWrapper::new(boxed_closure, $device.as_gcu_device()?.clone().into())
             },
             LLMModel::Mistral3VL(m) => {
                 let model_arc = Arc::clone(&m);
@@ -80,7 +80,7 @@ macro_rules! graph_model_wrapper {
                     model_arc.forward(input_ids, positions, kv_caches, input_metadata, None)
                 };
                 let boxed_closure: Box<ModelFn> = Box::new(closure);
-                CudaGraphWrapper::new(boxed_closure, $device.as_cuda_device()?.clone().into())
+                CudaGraphWrapper::new(boxed_closure, $device.as_gcu_device()?.clone().into())
             },
             $(
                 LLMModel::$variant(m) => {
