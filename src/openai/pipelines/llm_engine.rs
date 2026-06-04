@@ -600,38 +600,6 @@ impl LLMEngine {
         tasks
     }
 
-    #[cfg(all(feature = "cuda", feature = "graph"))]
-    fn graph_capture_all_pipelines(&mut self) -> Result<()> {
-        let mut ranks = self.pipelines.keys().copied().collect::<Vec<_>>();
-        ranks.sort_unstable();
-        for rank in ranks {
-            let (pipeline, cache_engine) = self.get_mut_pipeline(rank).ok_or_else(|| {
-                candle_core::Error::msg(format!("missing pipeline for rank {rank}"))
-            })?;
-            let device = pipeline.device();
-            let _ = device.as_cuda_device().unwrap().bind_to_thread();
-            pipeline.warmup_capture(Some(&cache_engine.get_kv_cache()))?;
-        }
-        self.scheduler.reset_mamba_state();
-        Ok(())
-    }
-
-    #[cfg(all(feature = "gcu", feature = "graph"))]
-    fn graph_capture_gcu_all_pipelines(&mut self) -> Result<()> {
-        let mut ranks = self.pipelines.keys().copied().collect::<Vec<_>>();
-        ranks.sort_unstable();
-        for rank in ranks {
-            let (pipeline, cache_engine) = self.get_mut_pipeline(rank).ok_or_else(|| {
-                candle_core::Error::msg(format!("missing pipeline for rank {rank}"))
-            })?;
-            let device = pipeline.device();
-            let _ = device.as_gcu_device().unwrap().bind_to_thread();
-            pipeline.warmup_capture(Some(&cache_engine.get_kv_cache()))?;
-        }
-        self.scheduler.reset_mamba_state();
-        Ok(())
-    }
-
     /// Warm up GCU graphs for rank 0 (tests / tooling).
     #[cfg(all(feature = "gcu", feature = "graph"))]
     pub fn graph_capture(engine: &Arc<RwLock<LLMEngine>>) -> Result<()> {
@@ -819,27 +787,9 @@ impl LLMEngine {
         let is_master_rank = DaemonManager::is_master_rank();
         #[cfg(not(feature = "eccl"))]
         let is_master_rank = true;
-        #[cfg(all(feature = "gcu", feature = "graph"))]
-        let (graph_capture_gcu_tx, graph_capture_gcu_rx) = std::sync::mpsc::sync_channel(1);
 
         let _ = tokio::task::spawn_blocking(move || {
             tokio::runtime::Handle::current().block_on(async move {
-                #[cfg(all(feature = "gcu", feature = "graph"))]
-                {
-                    let graph_capture_result = {
-                        let mut e = engine.write();
-                        e.graph_capture_gcu_all_pipelines()
-                    };
-                    let _ = graph_capture_gcu_tx.send(
-                        graph_capture_result
-                            .as_ref()
-                            .map(|_| ())
-                            .map_err(|e| format!("{e:?}")),
-                    );
-                    if graph_capture_result.is_err() {
-                        return;
-                    }
-                }
                 loop {
                     if engine.read().exit_flag.load(Ordering::Relaxed) {
                         break;
@@ -929,17 +879,6 @@ impl LLMEngine {
                 }
             });
         });
-
-        #[cfg(all(feature = "gcu", feature = "graph"))]
-        match graph_capture_gcu_rx.recv() {
-            Ok(Ok(())) => {}
-            Ok(Err(err)) => candle_core::bail!("Unable to capture gcu graph {err}!"),
-            Err(err) => candle_core::bail!(
-                "Failed to receive gcu graph warmup result from engine worker thread: {}",
-                err
-            ),
-        }
-
         Ok(engine_clone)
     }
 

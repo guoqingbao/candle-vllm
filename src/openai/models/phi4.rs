@@ -498,8 +498,17 @@ impl Mlp {
 impl Module for Mlp {
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
         let gate_up_states = self.gate_up_proj.forward(xs)?;
-        let up_states = (&gate_up_states[1] * self.act_fn.forward(&gate_up_states[0])?)?;
-        self.down_proj.forward(&up_states)
+        let activated = match self.act_fn {
+            candle_nn::Activation::Silu | candle_nn::Activation::Swish => {
+                let combined = Tensor::cat(
+                    &[&gate_up_states[0], &gate_up_states[1]],
+                    candle_core::D::Minus1,
+                )?;
+                candle_nn::ops::silu_and_mul(&combined)?
+            }
+            _ => (&gate_up_states[1] * self.act_fn.forward(&gate_up_states[0])?)?,
+        };
+        self.down_proj.forward(&activated)
     }
 }
 

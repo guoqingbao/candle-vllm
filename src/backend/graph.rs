@@ -39,7 +39,7 @@ mod graph_gcu {
 
         pub fn end_capture(
             stream: driv::topsStream_t,
-            flags: driv::topsGraphInstantiateFlags,
+            _flags: driv::topsGraphInstantiateFlags,
         ) -> Result<CudaGraph> {
             let mut graph = MaybeUninit::uninit();
             let cu_graph = unsafe {
@@ -56,7 +56,7 @@ mod graph_gcu {
                 driv::topsGraphInstantiateWithFlags(
                     graph_exec.as_mut_ptr(),
                     cu_graph,
-                    flags as u32 as u64,
+                    0 as u32 as u64,
                 )
                 .to_result()
                 .map_err(|e| {
@@ -461,11 +461,15 @@ mod graph_gcu {
                     last_len,
                 )
             };
+            // Enable the kernel parameter cache so that shape/stride metadata
+            // uploaded via htod_copy gets a fixed device address across warmup
+            // and capture phases.
+            let _param_cache_guard = candle_core::cuda_param_cache_scope(true);
+
             let mut outputs = BTreeMap::<usize, Tensor>::new();
-            for i in tqdm(0..self.graph_bs.len()).desc(Some("Graph capturing")) {
-                let bs = self.graph_bs[self.graph_bs.len() - i - 1];
-                let input_ids_bs = input_ids.narrow(0, 0, bs)?;
-                let positions_bs = positions.narrow(0, 0, bs)?;
+
+            // Helper closure to build InputMetadata for a given batch size.
+            let build_input_metadata = |bs: usize| -> Result<InputMetadata> {
                 #[cfg(feature = "flashinfer")]
                 let flashinfer_metadata = {
                     let mut indptr_host = Vec::with_capacity(bs + 1);
@@ -525,7 +529,8 @@ mod graph_gcu {
                 };
                 #[cfg(not(feature = "flashinfer"))]
                 let flashinfer_metadata = None;
-                let input_metadata = InputMetadata {
+
+                Ok(InputMetadata {
                     is_prefill: false,
                     sequence_ids: None,
                     mamba_slot_mapping: Some(mamba_slot_mapping.narrow(0, 0, bs)?),
@@ -540,7 +545,29 @@ mod graph_gcu {
                     disable_flash_attn: None,
                     seqlens: None,
                     flashinfer_metadata,
-                };
+                })
+            };
+
+            // Phase 1 – Warmup: run forward passes without capture to populate
+            // the kernel parameter cache and exercise allocators.
+            for i in 0..self.graph_bs.len() {
+                let bs = self.graph_bs[self.graph_bs.len() - i - 1];
+                let input_ids_bs = input_ids.narrow(0, 0, bs)?;
+                let positions_bs = positions.narrow(0, 0, bs)?;
+                let input_metadata = build_input_metadata(bs)?;
+                let _ =
+                    self.model
+                        .forward(&input_ids_bs, &positions_bs, kv_caches, &input_metadata)?;
+            }
+
+            // Phase 2 – Capture: graph capture with stable kernel parameter
+            // addresses.
+            for i in tqdm(0..self.graph_bs.len()).desc(Some("Graph capturing")) {
+                let bs = self.graph_bs[self.graph_bs.len() - i - 1];
+                let input_ids_bs = input_ids.narrow(0, 0, bs)?;
+                let positions_bs = positions.narrow(0, 0, bs)?;
+                let input_metadata = build_input_metadata(bs)?;
+
                 self.model.start_capture(bs)?;
                 let out =
                     self.model
@@ -548,6 +575,7 @@ mod graph_gcu {
                 self.model.end_capture()?;
                 outputs.insert(bs, out);
             }
+
             let _ = self.model.report_graph_pool_usage();
 
             tracing::warn!("Captured batches {:?}", outputs.keys());

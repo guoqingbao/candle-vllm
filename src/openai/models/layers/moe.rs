@@ -329,14 +329,17 @@ impl FusedMoe {
         let (num_tokens, hidden_dim) = xs.dims2()?;
         let router_logits = self.gate.forward(&xs)?;
 
-        let (mut topk_weights, topk_ids) = attention_rs::topk::topk_softmax(
-            &router_logits.to_dtype(DType::F32)?,
-            self.num_experts_per_tok,
-        )?;
-
-        if self.norm_topk_prob {
-            topk_weights = topk_weights.broadcast_div(&topk_weights.sum_keepdim(D::Minus1)?)?;
-        }
+        let (mut topk_weights, topk_ids) = if self.norm_topk_prob {
+            attention_rs::topk::topk_softmax_renorm(
+                &router_logits.to_dtype(DType::F32)?,
+                self.num_experts_per_tok,
+            )?
+        } else {
+            attention_rs::topk::topk_softmax(
+                &router_logits.to_dtype(DType::F32)?,
+                self.num_experts_per_tok,
+            )?
+        };
 
         if let Some(routed_scaling_factor) = self.routed_scaling_factor {
             topk_weights = (topk_weights * routed_scaling_factor)?;
@@ -356,6 +359,7 @@ impl FusedMoe {
             &xs,
             &self.gate_w,
             &None,
+            &topk_ids,
             &sorted_token_ids,
             &expert_ids,
             &num_tokens_post_pad,
@@ -368,6 +372,7 @@ impl FusedMoe {
             &xs,
             &self.up_w,
             &None,
+            &topk_ids,
             &sorted_token_ids,
             &expert_ids,
             &num_tokens_post_pad,
@@ -384,6 +389,7 @@ impl FusedMoe {
                 &down_inputs,
                 &self.down_w,
                 &down_topk_weights,
+                &topk_ids,
                 &sorted_token_ids,
                 &expert_ids,
                 &num_tokens_post_pad,

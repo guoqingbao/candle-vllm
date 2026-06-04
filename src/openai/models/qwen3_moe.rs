@@ -131,9 +131,16 @@ impl Mlp {
 
 impl Module for Mlp {
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
-        let lhs = self.act_fn.forward(&self.gate_proj.forward(xs)?)?;
-        let rhs = self.up_proj.forward(xs)?;
-        self.down_proj.forward(&(&lhs * &rhs)?)
+        let gate = self.gate_proj.forward(xs)?;
+        let up = self.up_proj.forward(xs)?;
+        let activated = match self.act_fn {
+            candle_nn::Activation::Silu | candle_nn::Activation::Swish => {
+                let combined = Tensor::cat(&[&gate, &up], candle_core::D::Minus1)?;
+                candle_nn::ops::silu_and_mul(&combined)?
+            }
+            _ => (self.act_fn.forward(&gate)? * up)?,
+        };
+        self.down_proj.forward(&activated)
     }
 }
 

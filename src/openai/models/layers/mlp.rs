@@ -451,6 +451,21 @@ impl Module for Mlp {
                 (gate_up[0].clone(), gate_up[1].clone())
             }
         };
-        self.down_proj.forward(&(self.act_fn.forward(&gate)? * up)?)
+        let activated = match self.act_fn {
+            candle_nn::Activation::Silu | candle_nn::Activation::Swish => {
+                let combined = Tensor::cat(&[&gate, &up], candle_core::D::Minus1)?;
+                candle_nn::ops::silu_and_mul(&combined)?
+            }
+            candle_nn::Activation::Gelu | candle_nn::Activation::NewGelu => {
+                let combined = Tensor::cat(&[&gate, &up], candle_core::D::Minus1)?;
+                candle_nn::ops::gelu_and_mul(&combined)?
+            }
+            candle_nn::Activation::GeluPytorchTanh => {
+                let combined = Tensor::cat(&[&gate, &up], candle_core::D::Minus1)?;
+                candle_nn::ops::gelu_tanh_and_mul(&combined)?
+            }
+            _ => (self.act_fn.forward(&gate)? * up)?,
+        };
+        self.down_proj.forward(&activated)
     }
 }
