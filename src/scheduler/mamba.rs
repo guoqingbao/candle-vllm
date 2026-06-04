@@ -42,9 +42,9 @@ impl Scheduler {
         groups: &VecDeque<Arc<SequenceGroup>>,
         chunk_size: usize,
     ) -> Vec<MambaPrefixCapture> {
-        if groups.is_empty()
+        if !self.block_engine.requires_mamba_prefix_snapshots()
+            || groups.is_empty()
             || chunk_size == 0
-            || !self.block_engine.require_mamba_prefix_snapshots()
         {
             return Vec::new();
         }
@@ -96,7 +96,7 @@ impl Scheduler {
         &self,
         groups: &VecDeque<Arc<SequenceGroup>>,
     ) -> Vec<MambaPrefixCapture> {
-        if groups.is_empty() || !self.block_engine.require_mamba_prefix_snapshots() {
+        if !self.block_engine.requires_mamba_prefix_snapshots() || groups.is_empty() {
             return Vec::new();
         }
 
@@ -139,7 +139,7 @@ impl Scheduler {
         &mut self,
         groups: &VecDeque<Arc<SequenceGroup>>,
     ) -> Vec<MambaRestorePlan> {
-        if groups.is_empty() || !self.block_engine.require_mamba_prefix_snapshots() {
+        if !self.block_engine.requires_mamba_prefix_snapshots() || groups.is_empty() {
             return Vec::new();
         }
 
@@ -291,14 +291,14 @@ impl Scheduler {
             .fallback_sequence_to_full_prefill(sequence);
         if rebuilt {
             tracing::warn!(
-                "Seq {} {} (cached {} tokens); rebuilt block table and falling back to full prefill",
+                "Seq {} {} (cached {} tokens), falling back to full prefill",
                 seq_id,
                 reason,
                 cached_tokens
             );
         } else {
             tracing::warn!(
-                "Seq {} {} (cached {} tokens); unable to rebuild block table due memory pressure, keeping cached prefill",
+                "Seq {} {} (cached {} tokens), unable to rebuild block table due memory pressure",
                 seq_id,
                 reason,
                 cached_tokens

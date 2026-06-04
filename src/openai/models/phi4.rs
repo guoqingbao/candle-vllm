@@ -277,7 +277,7 @@ impl Phi4RotaryEmbedding {
 #[cfg(test)]
 mod tests {
     use super::Phi4RotaryEmbedding;
-    use crate::openai::models::{Config, ScalingValue};
+    use crate::openai::models::{Config, KvCacheDtype, ScalingValue};
     use std::collections::HashMap;
 
     fn test_config(max_position_embeddings: usize) -> Config {
@@ -314,7 +314,7 @@ mod tests {
             moe_config: None,
             quantization_config: None,
             isq_quant: None,
-            fp8_kvcache: None,
+            kvcache_dtype: KvCacheDtype::Auto,
             extra_config_json: None,
         }
     }
@@ -412,7 +412,7 @@ impl Phi4Attention {
                 cfg.sliding_window,
                 vb.device().clone(),
                 None,
-                cfg.fp8_kvcache.unwrap_or(false),
+                cfg.kvcache_dtype.is_fp8_keys(),
             )?,
         })
     }

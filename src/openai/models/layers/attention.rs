@@ -1,7 +1,7 @@
 use super::rotary_emb::ScalingRotaryEmbedding;
 use crate::openai::distributed::{
-    rms_norm_x, shard, Comm, MergedParallelColumnLinear, TensorParallelColumnLinear,
-    TensorParallelRowLinear, VarBuilder,
+    rms_norm_sharded, rms_norm_x, shard, Comm, MergedParallelColumnLinear,
+    TensorParallelColumnLinear, TensorParallelRowLinear, VarBuilder,
 };
 use crate::openai::models::layers::qrmsnorm::QRmsNorm;
 use crate::openai::models::Config;
@@ -37,6 +37,9 @@ pub struct Attention {
     dtype: DType,
     attn_output_gate: bool,
     no_per_head_norm: bool,
+    full_dim_qk_norm: bool,
+    qk_l2_norm: bool,
+    v_norm_eps: Option<f64>,
 }
 
 impl Attention {
@@ -193,6 +196,7 @@ impl Attention {
         dtype: DType,
         quant_cfg: &Option<crate::openai::models::QuantConfig>,
         quant: &Option<String>,
+        k_eq_v: bool,
     ) -> Result<Option<QkvProjection>> {
         if quant.is_some() {
             return Ok(None);
@@ -202,7 +206,11 @@ impl Attention {
         let kv_shard = shard(0, comm.rank(), comm.world_size());
         let q_vb = vb.pp("q_proj");
         let k_vb = vb.pp("k_proj");
-        let v_vb = vb.pp("v_proj");
+        let v_vb = if k_eq_v {
+            vb.pp("k_proj")
+        } else {
+            vb.pp("v_proj")
+        };
 
         let is_fp8_quant = quant_cfg
             .as_ref()
@@ -350,6 +358,28 @@ impl Attention {
         comm: Rc<Comm>,
         sliding_window: Option<usize>,
     ) -> Result<Self> {
+        Self::new_with_option(
+            rotary_emb,
+            cfg,
+            vb.clone(),
+            comm,
+            sliding_window,
+            false,
+            false,
+            None,
+        )
+    }
+
+    pub fn new_with_option(
+        rotary_emb: Arc<ScalingRotaryEmbedding>,
+        cfg: &Config,
+        vb: VarBuilder,
+        comm: Rc<Comm>,
+        sliding_window: Option<usize>,
+        k_eq_v: bool,
+        qk_l2_norm: bool,
+        attention_scale: Option<f32>,
+    ) -> Result<Self> {
         let hidden_sz = cfg.hidden_size;
         let num_heads = cfg.num_attention_heads;
         let num_kv_heads = cfg.num_key_value_heads.unwrap();
@@ -392,6 +422,7 @@ impl Attention {
             vb.dtype(),
             &cfg.quantization_config,
             &cfg.isq_quant,
+            k_eq_v,
         )? {
             packed
         } else {
@@ -430,7 +461,7 @@ impl Attention {
                 hidden_sz,
                 num_kv_heads * head_dim,
                 attention_bias,
-                vb.pp("v_proj"),
+                vb.pp(if k_eq_v { "k_proj" } else { "v_proj" }),
                 comm.clone(),
                 v_proj_quant,
                 &cfg.quantization_config,
@@ -452,23 +483,78 @@ impl Attention {
             &cfg.quantization_config,
         )?;
 
-        //we use higher precision for q/k norm
-        let q_norm = rms_norm_x(
+        let q_norm_perhead = rms_norm_x(
             head_dim,
             cfg.rms_norm_eps,
             vb.pp("q_norm"),
             DType::F32,
             qk_norm_add_one,
-        )
-        .ok();
-        let k_norm = rms_norm_x(
+        );
+        let k_norm_perhead = rms_norm_x(
             head_dim,
             cfg.rms_norm_eps,
             vb.pp("k_norm"),
             DType::F32,
             qk_norm_add_one,
-        )
-        .ok();
+        );
+
+        let (q_norm, k_norm, full_dim_qk_norm) = if q_norm_perhead.is_ok() && k_norm_perhead.is_ok()
+        {
+            (
+                Some(q_norm_perhead.unwrap()),
+                Some(k_norm_perhead.unwrap()),
+                false,
+            )
+        } else {
+            let q_shard = shard(0, comm.rank(), comm.world_size());
+            let kv_shard = shard(0, comm.rank(), comm.world_size());
+            let q_full = rms_norm_sharded(
+                num_heads * head_dim,
+                cfg.rms_norm_eps,
+                vb.pp("q_norm"),
+                DType::F32,
+                qk_norm_add_one,
+                q_shard,
+            );
+            let k_full = rms_norm_sharded(
+                num_kv_heads * head_dim,
+                cfg.rms_norm_eps,
+                vb.pp("k_norm"),
+                DType::F32,
+                qk_norm_add_one,
+                kv_shard,
+            );
+            if q_full.is_ok() && k_full.is_ok() {
+                (Some(q_full.unwrap()), Some(k_full.unwrap()), true)
+            } else {
+                (None, None, false)
+            }
+        };
+
+        let is_gemma4 = arch == "Gemma4ForConditionalGeneration" || arch == "Gemma4ForCausalLM";
+        let v_norm_eps = if is_gemma4 {
+            Some(cfg.rms_norm_eps)
+        } else {
+            None
+        };
+        let no_per_head_norm_models: Vec<String> = vec![
+            "Gemma3ForConditionalGeneration",
+            "Gemma3ForCausalLM",
+            "Gemma4ForConditionalGeneration",
+            "Gemma4ForCausalLM",
+            "Qwen3VLForConditionalGeneration",
+            "Qwen3VLMoeForConditionalGeneration",
+            "Qwen3_5ForCausalLM",
+            "Qwen3_5ForConditionalGeneration",
+            "Qwen3_5MoeForCausalLM",
+            "Qwen3_5MoeForConditionalGeneration",
+            "Qwen3NextForCausalLM",
+            "Qwen3NextForConditionalGeneration",
+            "MiniMaxM2ForCausalLM",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
 
         assert!(cfg.num_attention_heads >= comm.world_size());
         assert!(cfg.num_attention_heads % comm.world_size() == 0);
@@ -490,27 +576,32 @@ impl Attention {
             attn: PagedAttention::new(
                 attention_heads,
                 head_dim,
-                1. / ((head_dim as f32).sqrt()),
+                attention_scale.unwrap_or(1. / ((head_dim as f32).sqrt())),
                 Some(kv_heads),
                 sliding_window,
                 vb.device().clone(),
                 None,
-                cfg.fp8_kvcache.unwrap_or(false),
+                cfg.kvcache_dtype.is_fp8_keys(),
             )?,
             softcapping: cfg.attn_logit_softcapping,
             dtype: vb.dtype(),
             attn_output_gate,
-            no_per_head_norm: is_qwen35_or_next,
+            no_per_head_norm: no_per_head_norm_models.contains(&arch),
+            full_dim_qk_norm,
+            qk_l2_norm,
+            v_norm_eps,
         })
     }
 
-    pub fn forward(
+    pub fn forward_ext(
         &self,
         xs: &Tensor,
+        rotary_emb: Option<&ScalingRotaryEmbedding>,
         attention_mask: Option<&Vec<Tensor>>,
         input_positions: &Tensor,
         cache: Option<(&Tensor, &Tensor)>,
         input_metadata: &InputMetadata,
+        q_scale: Option<&Tensor>,
     ) -> Result<Tensor> {
         let (seq_len, _) = xs.dims2()?;
 
@@ -561,8 +652,6 @@ impl Attention {
         let k = key_states.reshape((seq_len, self.num_kv_heads, self.head_dim))?;
         let v = value_states.reshape((seq_len, self.num_kv_heads, self.head_dim))?;
 
-        // Q/K norm weights are loaded in F32 for Qwen3.5/Next; cast activations
-        // to keep CUDA RMSNorm dtype-consistent.
         let (q, k) = if q.dtype() != DType::F32 {
             (q.to_dtype(DType::F32)?, k.to_dtype(DType::F32)?)
         } else {
@@ -570,18 +659,31 @@ impl Attention {
         };
 
         let (q, k) = if let (Some(q_norm), Some(k_norm)) = (&self.q_norm, &self.k_norm) {
-            #[cfg(feature = "gcu")]
-            {
-                let q = q
-                    .reshape((1, seq_len, self.num_heads, self.head_dim))?
-                    .transpose(1, 2)?
-                    .contiguous()?;
-                let k = k
-                    .reshape((1, seq_len, self.num_kv_heads, self.head_dim))?
-                    .transpose(1, 2)?
-                    .contiguous()?;
-                let q_flat = q.flatten(0, 2)?;
-                let k_flat = k.flatten(0, 2)?;
+            if self.full_dim_qk_norm {
+                let q_2d = q.reshape((seq_len, self.num_heads * self.head_dim))?;
+                let k_2d = k.reshape((seq_len, self.num_kv_heads * self.head_dim))?;
+                let q_2d = q_norm.forward(&q_2d)?;
+                let k_2d = k_norm.forward(&k_2d)?;
+                let q = q_2d.reshape((seq_len, self.num_heads, self.head_dim))?;
+                let k = k_2d.reshape((seq_len, self.num_kv_heads, self.head_dim))?;
+                (q, k)
+            } else if self.no_per_head_norm {
+                let q = q_norm.forward(&q)?;
+                let k = k_norm.forward(&k)?;
+                (q, k)
+            } else {
+                #[cfg(feature = "gcu")]
+                {
+                    let q = q
+                        .reshape((1, seq_len, self.num_heads, self.head_dim))?
+                        .transpose(1, 2)?
+                        .contiguous()?;
+                    let k = k
+                        .reshape((1, seq_len, self.num_kv_heads, self.head_dim))?
+                        .transpose(1, 2)?
+                        .contiguous()?;
+                    let q_flat = q.flatten(0, 2)?;
+                    let k_flat = k.flatten(0, 2)?;
                 let q_flat = q_norm.forward(&q_flat)?;
                 let k_flat = k_norm.forward(&k_flat)?;
                 let q = q_flat
@@ -619,10 +721,34 @@ impl Attention {
             (q, k)
         };
 
-        let (q, k) = self.rotary_emb.apply_rotary_emb(&q, &k, input_positions)?;
+        let (mut q, mut k) = if let Some(rotary_emb) = rotary_emb {
+            rotary_emb.apply_rotary_emb(&q, &k, input_positions)?
+        } else {
+            (q, k)
+        };
+        if self.qk_l2_norm {
+            let q_rms = (q.sqr()?.mean_keepdim(candle_core::D::Minus1)? + 1e-5)?.sqrt()?;
+            let k_rms = (k.sqr()?.mean_keepdim(candle_core::D::Minus1)? + 1e-5)?.sqrt()?;
+            q = q.broadcast_div(&q_rms)?;
+            k = k.broadcast_div(&k_rms)?;
+        }
+        if let Some(scale) = q_scale {
+            let scale = scale.reshape((seq_len, 1, 1))?;
+            q = q.broadcast_mul(&scale.to_dtype(q.dtype())?)?;
+        }
         let (q, k) = (q.to_dtype(self.dtype)?, k.to_dtype(self.dtype)?);
         let v = if v.dtype() != self.dtype {
             v.to_dtype(self.dtype)?
+        } else {
+            v
+        };
+
+        let v = if let Some(eps) = self.v_norm_eps {
+            let orig_dtype = v.dtype();
+            let v_f32 = v.to_dtype(DType::F32)?;
+            let mean_sq = v_f32.sqr()?.mean_keepdim(candle_core::D::Minus1)?;
+            let rms = (mean_sq + eps)?.sqrt()?;
+            v_f32.broadcast_div(&rms)?.to_dtype(orig_dtype)?
         } else {
             v
         };
@@ -655,6 +781,25 @@ impl Attention {
         let y = self.o_proj.forward(&y.to_dtype(xs.dtype())?)?;
         Ok(y)
     }
+
+    pub fn forward(
+        &self,
+        xs: &Tensor,
+        attention_mask: Option<&Vec<Tensor>>,
+        input_positions: &Tensor,
+        cache: Option<(&Tensor, &Tensor)>,
+        input_metadata: &InputMetadata,
+    ) -> Result<Tensor> {
+        self.forward_ext(
+            xs,
+            Some(self.rotary_emb.as_ref()),
+            attention_mask,
+            input_positions,
+            cache,
+            input_metadata,
+            None,
+        )
+    }
 }
 
 pub struct QuantizedAttention {
@@ -670,6 +815,7 @@ pub struct QuantizedAttention {
     n_head: usize,
     n_kv_head: usize,
     head_dim: usize,
+    attn_output_gate: bool,
     attn: PagedAttention,
     rotary_emb: Arc<ScalingRotaryEmbedding>,
     dtype: DType,
@@ -746,6 +892,11 @@ impl QuantizedAttention {
         let head_dim = config
             .head_dim
             .unwrap_or(config.hidden_size / config.num_attention_heads);
+        let n_head = config.num_attention_heads;
+        let expected_q_dim = n_head * head_dim;
+        let q_out_dim = attention_wq.shape().dims()[0];
+        let attn_output_gate = q_out_dim == expected_q_dim * 2;
+
         Ok(QuantizedAttention {
             attention_wq: QMatMul::from_qtensor(attention_wq)?,
             attention_wk: QMatMul::from_qtensor(attention_wk)?,
@@ -756,11 +907,12 @@ impl QuantizedAttention {
             attention_wo: QMatMul::from_qtensor(attention_wo)?,
             q_norm,
             k_norm,
-            n_head: config.num_attention_heads,
+            n_head,
             n_kv_head: config
                 .num_key_value_heads
                 .unwrap_or(config.num_attention_heads),
             head_dim,
+            attn_output_gate,
             attn: PagedAttention::new(
                 config.num_attention_heads,
                 head_dim,
@@ -769,7 +921,7 @@ impl QuantizedAttention {
                 sliding_window,
                 device.clone(),
                 None,
-                config.fp8_kvcache.unwrap_or(false),
+                config.kvcache_dtype.is_fp8_keys(),
             )?,
             rotary_emb: rotary_emb.clone(),
             dtype,
@@ -786,31 +938,44 @@ impl QuantizedAttention {
     ) -> Result<Tensor> {
         let (seq_len, _) = x.dims2()?;
 
-        let q = self.attention_wq.forward(x)?;
+        let q_raw = self.attention_wq.forward(x)?;
         let k = self.attention_wk.forward(x)?;
         let v = self.attention_wv.forward(x)?;
 
-        let q = if self.attention_bq.is_some() {
-            q.broadcast_add(self.attention_bq.as_ref().unwrap())?
+        let q_raw = if let Some(bq) = &self.attention_bq {
+            q_raw.broadcast_add(bq)?
         } else {
-            q
+            q_raw
         };
 
-        let k = if self.attention_bk.is_some() {
-            k.broadcast_add(self.attention_bk.as_ref().unwrap())?
+        let k = if let Some(bk) = &self.attention_bk {
+            k.broadcast_add(bk)?
         } else {
             k
         };
 
-        let v = if self.attention_bv.is_some() {
-            v.broadcast_add(self.attention_bv.as_ref().unwrap())?
+        let v = if let Some(bv) = &self.attention_bv {
+            v.broadcast_add(bv)?
         } else {
             v
         };
 
+        let local_q_dim = self.n_head * self.head_dim;
+        let (q_linear, gate) = if self.attn_output_gate {
+            let q_gate = q_raw.reshape((seq_len, self.n_head, self.head_dim * 2))?;
+            let q = q_gate.narrow(2, 0, self.head_dim)?;
+            let gate = q_gate.narrow(2, self.head_dim, self.head_dim)?;
+            (
+                q.reshape((seq_len, local_q_dim))?,
+                Some(gate.reshape((seq_len, local_q_dim))?),
+            )
+        } else {
+            (q_raw, None)
+        };
+
         #[cfg(feature = "gcu")]
         let (q, k, v) = {
-            let q = q
+            let q = q_linear
                 .reshape((1, seq_len, self.n_head, self.head_dim))?
                 .transpose(1, 2)?;
             let k = k
@@ -824,7 +989,7 @@ impl QuantizedAttention {
         };
         #[cfg(not(feature = "gcu"))]
         let (q, k, v) = {
-            let q = q.reshape((seq_len, self.n_head, self.head_dim))?;
+            let q = q_linear.reshape((seq_len, self.n_head, self.head_dim))?;
             let k = k.reshape((seq_len, self.n_kv_head, self.head_dim))?;
             let v = v.reshape((seq_len, self.n_kv_head, self.head_dim))?;
             (q, k, v)
@@ -901,7 +1066,13 @@ impl QuantizedAttention {
             )?
             .reshape((seq_len, ()))?;
 
-        let y = self.attention_wo.forward(&y.to_dtype(x.dtype())?)?;
-        Ok(y)
+        let y = if let Some(gate) = gate {
+            let gate = gate.to_dtype(y.dtype())?;
+            y.broadcast_mul(&candle_nn::ops::sigmoid(&gate)?)?
+        } else {
+            y
+        };
+
+        self.attention_wo.forward(&y.to_dtype(DType::F32)?)
     }
 }

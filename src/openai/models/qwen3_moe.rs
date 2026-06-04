@@ -9,7 +9,7 @@ use crate::openai::distributed::{
 use crate::openai::models::layers::deepstack::ApplyDeepStack;
 use crate::openai::models::layers::moe::FusedMoe;
 #[cfg(not(feature = "gcu"))]
-use crate::openai::models::layers::moe::{FusedMoeFp8, FusedMoeISQ};
+use crate::openai::models::layers::moe::{FusedMoeFp8, FusedMoeISQ, FusedMoeMxfp4, FusedMoeNvfp4};
 use crate::openai::models::linear::LinearX as Linear;
 use crate::openai::models::mask::get_attention_causal_mask;
 use crate::openai::models::QwenMoEConfig;
@@ -151,6 +151,8 @@ enum MoeOrMlp {
     FusedMoeISQ(FusedMoeISQ),
     #[cfg(not(feature = "gcu"))]
     FusedMoeFp8(FusedMoeFp8),
+    FusedMoeMxfp4(FusedMoeMxfp4),
+    FusedMoeNvfp4(FusedMoeNvfp4),
     Mlp(Mlp),
 }
 
@@ -163,6 +165,8 @@ impl MoeOrMlp {
             Self::FusedMoeISQ(m) => m.forward(xs, is_prefill),
             #[cfg(not(feature = "gcu"))]
             Self::FusedMoeFp8(m) => m.forward(xs, is_prefill),
+            Self::FusedMoeMxfp4(m) => m.forward(xs, is_prefill),
+            Self::FusedMoeNvfp4(m) => m.forward(xs, is_prefill),
         }
     }
 }
@@ -207,7 +211,6 @@ impl DecoderLayer {
             && (moe_cfg.num_experts.unwrap_or(0) > 0
                 && (layer_idx + 1) % moe_cfg.decoder_sparse_step.unwrap_or(1) == 0)
         {
-            // Check for FP8 quantization first
             if let Some(ref quant_cfg) = cfg.quantization_config {
                 if quant_cfg.quant_method == "fp8" {
                     #[cfg(feature = "gcu")]
@@ -222,6 +225,34 @@ impl DecoderLayer {
                             comm.clone(),
                             dtype,
                             quant_cfg,
+                        )?)
+                    }
+                } else if quant_cfg.quant_method == "mxfp4" {
+                    #[cfg(feature = "gcu")]
+                    {
+                        candle::bail!("MXFP4 MoE is not supported on GCU")
+                    }
+                    #[cfg(not(feature = "gcu"))]
+                    {
+                        MoeOrMlp::FusedMoeMxfp4(FusedMoeMxfp4::new(
+                            cfg,
+                            vb.pp("mlp").clone(),
+                            comm.clone(),
+                            dtype,
+                        )?)
+                    }
+                } else if quant_cfg.quant_method == "nvfp4" {
+                    #[cfg(feature = "gcu")]
+                    {
+                        candle::bail!("NVFP4 MoE is not supported on GCU")
+                    }
+                    #[cfg(not(feature = "gcu"))]
+                    {
+                        MoeOrMlp::FusedMoeNvfp4(FusedMoeNvfp4::new(
+                            cfg,
+                            vb.pp("mlp").clone(),
+                            comm.clone(),
+                            dtype,
                         )?)
                     }
                 } else if cfg.isq_quant.is_some() {
