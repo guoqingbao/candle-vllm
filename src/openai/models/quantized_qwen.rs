@@ -109,6 +109,7 @@ impl GGUFQWen {
             moe_config: None,
             isq_quant: None,
             kvcache_dtype: KvCacheDtype::Auto,
+            fp8_kvcache: None,
             extra_config_json: None,
         }
     }

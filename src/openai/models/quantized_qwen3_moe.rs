@@ -173,6 +173,7 @@ impl GGUFQWenMoE {
             moe_config: Some(MoEConfig::QwenMoE(moe_cfg.clone())),
             isq_quant: None,
             kvcache_dtype: KvCacheDtype::Auto,
+            fp8_kvcache: None,
             extra_config_json: None,
         }
     }

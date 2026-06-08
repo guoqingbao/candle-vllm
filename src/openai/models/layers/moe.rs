@@ -325,6 +325,132 @@ impl FusedMoe {
         })
     }
 
+    pub fn new_with_gate(
+        cfg: &Config,
+        gate_vb: VarBuilder,
+        experts_vb: VarBuilder,
+        comm: Rc<Comm>,
+        dtype: DType,
+    ) -> Result<Self> {
+        let moe_cfg = qwen_moe_cfg(cfg)?;
+        let num_experts = moe_cfg.num_experts.unwrap_or(0);
+        if num_experts == 0 {
+            candle::bail!("num_experts must be > 0")
+        }
+
+        let gate = linear_no_bias(cfg.hidden_size, num_experts, gate_vb, Shard::default())?;
+        let (gate_w, up_w, down_w) = load_packed_experts(cfg, experts_vb, comm.clone())?;
+        #[cfg(not(feature = "gcu"))]
+        let (gate_up_w, w_size_n) = {
+            let gate_up_w = Tensor::cat(&[&gate_w, &up_w], 1)?;
+            let w_size_n = gate_up_w.dim(1)? / 2;
+            (gate_up_w, w_size_n)
+        };
+        let world_size = comm.world_size();
+
+        Ok(Self {
+            gate,
+            #[cfg(feature = "gcu")]
+            gate_w,
+            #[cfg(feature = "gcu")]
+            up_w,
+            #[cfg(not(feature = "gcu"))]
+            gate_up_w,
+            #[cfg(not(feature = "gcu"))]
+            w_size_n,
+            down_w,
+            act: cfg
+                .hidden_act
+                .or(cfg.hidden_activation)
+                .unwrap_or(candle_nn::Activation::Silu),
+            norm_topk_prob: moe_cfg.norm_topk_prob,
+            routed_scaling_factor: moe_cfg.routed_scaling_factor,
+            num_experts_per_tok: moe_cfg.num_experts_per_tok,
+            all_reduce: AllReduce::new(comm),
+            world_size,
+            dtype,
+        })
+    }
+
+    pub fn forward_with_routing(
+        &self,
+        xs: &Tensor,
+        topk_weights: Tensor,
+        topk_ids: Tensor,
+        _is_prefill: bool,
+    ) -> Result<Tensor> {
+        let (num_tokens, hidden_dim) = xs.dims2()?;
+
+        const MOE_BLOCK_SIZE: usize = 32;
+
+        let (sorted_token_ids, expert_ids, num_tokens_post_pad) = moe::gcu_moe_align_block_size(
+            &topk_ids,
+            self.gate_w.dim(0)?,
+            MOE_BLOCK_SIZE,
+            num_tokens,
+            self.num_experts_per_tok,
+        )?;
+
+        let gate = moe::moe_gemm(
+            &xs,
+            &self.gate_w,
+            &None,
+            &topk_ids,
+            &sorted_token_ids,
+            &expert_ids,
+            &num_tokens_post_pad,
+            self.num_experts_per_tok,
+            MOE_BLOCK_SIZE,
+            num_tokens,
+        )?;
+
+        let up = moe::moe_gemm(
+            &xs,
+            &self.up_w,
+            &None,
+            &topk_ids,
+            &sorted_token_ids,
+            &expert_ids,
+            &num_tokens_post_pad,
+            self.num_experts_per_tok,
+            MOE_BLOCK_SIZE,
+            num_tokens,
+        )?;
+
+        let down_inputs = (up * gate.apply(&self.act)?)?;
+
+        let mut ys = {
+            let down_topk_weights = Some(topk_weights.flatten_all()?);
+            moe::moe_gemm(
+                &down_inputs,
+                &self.down_w,
+                &down_topk_weights,
+                &topk_ids,
+                &sorted_token_ids,
+                &expert_ids,
+                &num_tokens_post_pad,
+                self.num_experts_per_tok,
+                MOE_BLOCK_SIZE,
+                num_tokens,
+            )?
+        };
+
+        ys = ys
+            .to_dtype(DType::F32)?
+            .reshape((num_tokens, self.num_experts_per_tok, hidden_dim))?
+            .transpose(1, 2)?
+            .contiguous()?
+            .reshape((num_tokens * hidden_dim, self.num_experts_per_tok))?
+            .sum(D::Minus1)?
+            .reshape((num_tokens, hidden_dim))?
+            .to_dtype(xs.dtype())?;
+
+        if self.world_size > 1 {
+            ys = self.all_reduce.apply(&ys)?;
+        }
+        Ok(ys)
+    }
+
     pub fn forward(&self, xs: &Tensor, _is_prefill: bool) -> Result<Tensor> {
         let (num_tokens, hidden_dim) = xs.dims2()?;
         let router_logits = self.gate.forward(&xs)?;
@@ -413,6 +539,42 @@ impl FusedMoe {
             ys = self.all_reduce.apply(&ys)?;
         }
         Ok(ys)
+    }
+}
+
+#[cfg(feature = "gcu")]
+pub struct FusedMoeISQ {
+    _phantom: std::marker::PhantomData<()>,
+}
+
+#[cfg(feature = "gcu")]
+impl FusedMoeISQ {
+    pub fn new(_cfg: &Config, _vb: VarBuilder, _comm: Rc<Comm>, _dtype: DType) -> Result<Self> {
+        candle::bail!("FusedMoeISQ is not supported on GCU")
+    }
+
+    pub fn new_with_gate(
+        _cfg: &Config,
+        _gate_vb: VarBuilder,
+        _experts_vb: VarBuilder,
+        _comm: Rc<Comm>,
+        _dtype: DType,
+    ) -> Result<Self> {
+        candle::bail!("FusedMoeISQ is not supported on GCU")
+    }
+
+    pub fn forward(&self, _xs: &Tensor, _is_prefill: bool) -> Result<Tensor> {
+        candle::bail!("FusedMoeISQ is not supported on GCU")
+    }
+
+    pub fn forward_with_routing(
+        &self,
+        _xs: &Tensor,
+        _topk_weights: Tensor,
+        _topk_ids: Tensor,
+        _is_prefill: bool,
+    ) -> Result<Tensor> {
+        candle::bail!("FusedMoeISQ is not supported on GCU")
     }
 }
 
@@ -720,6 +882,49 @@ impl FusedMoeISQ {
 }
 
 /// FP8 Mixture of Experts layer with block-wise scales
+#[cfg(feature = "gcu")]
+pub struct FusedMoeFp8 {
+    _phantom: std::marker::PhantomData<()>,
+}
+
+#[cfg(feature = "gcu")]
+impl FusedMoeFp8 {
+    pub fn new(
+        _cfg: &Config,
+        _vb: VarBuilder,
+        _comm: Rc<Comm>,
+        _dtype: DType,
+        _quant_cfg: &crate::openai::models::QuantConfig,
+    ) -> Result<Self> {
+        candle::bail!("FusedMoeFp8 is not supported on GCU")
+    }
+
+    pub fn new_with_gate(
+        _cfg: &Config,
+        _gate_vb: VarBuilder,
+        _experts_vb: VarBuilder,
+        _comm: Rc<Comm>,
+        _dtype: DType,
+        _quant_cfg: &crate::openai::models::QuantConfig,
+    ) -> Result<Self> {
+        candle::bail!("FusedMoeFp8 is not supported on GCU")
+    }
+
+    pub fn forward(&self, _xs: &Tensor, _is_prefill: bool) -> Result<Tensor> {
+        candle::bail!("FusedMoeFp8 is not supported on GCU")
+    }
+
+    pub fn forward_with_routing(
+        &self,
+        _xs: &Tensor,
+        _topk_weights: Tensor,
+        _topk_ids: Tensor,
+        _is_prefill: bool,
+    ) -> Result<Tensor> {
+        candle::bail!("FusedMoeFp8 is not supported on GCU")
+    }
+}
+
 #[cfg(not(feature = "gcu"))]
 pub struct FusedMoeFp8 {
     gate: Linear,
@@ -1056,4 +1261,76 @@ impl FusedMoeFp8 {
         }
         Ok(ys.to_dtype(self.dtype)?)
     }
+}
+
+pub struct FusedMoeMxfp4 {
+    _phantom: std::marker::PhantomData<()>,
+}
+
+impl FusedMoeMxfp4 {
+    pub fn new(_cfg: &Config, _vb: VarBuilder, _comm: Rc<Comm>, _dtype: DType) -> Result<Self> {
+        candle::bail!("FusedMoeMxfp4 is not supported on GCU")
+    }
+
+    pub fn new_with_gate(
+        _cfg: &Config,
+        _gate_vb: VarBuilder,
+        _experts_vb: VarBuilder,
+        _comm: Rc<Comm>,
+        _dtype: DType,
+    ) -> Result<Self> {
+        candle::bail!("FusedMoeMxfp4 is not supported on GCU")
+    }
+
+    pub fn forward(&self, _xs: &Tensor, _is_prefill: bool) -> Result<Tensor> {
+        candle::bail!("FusedMoeMxfp4 is not supported on GCU")
+    }
+
+    pub fn forward_with_routing(
+        &self,
+        _xs: &Tensor,
+        _topk_weights: Tensor,
+        _topk_ids: Tensor,
+        _is_prefill: bool,
+    ) -> Result<Tensor> {
+        candle::bail!("FusedMoeMxfp4 is not supported on GCU")
+    }
+}
+
+pub struct FusedMoeNvfp4 {
+    _phantom: std::marker::PhantomData<()>,
+}
+
+impl FusedMoeNvfp4 {
+    pub fn new(_cfg: &Config, _vb: VarBuilder, _comm: Rc<Comm>, _dtype: DType) -> Result<Self> {
+        candle::bail!("FusedMoeNvfp4 is not supported on GCU")
+    }
+
+    pub fn new_with_gate(
+        _cfg: &Config,
+        _gate_vb: VarBuilder,
+        _experts_vb: VarBuilder,
+        _comm: Rc<Comm>,
+        _dtype: DType,
+    ) -> Result<Self> {
+        candle::bail!("FusedMoeNvfp4 is not supported on GCU")
+    }
+
+    pub fn forward(&self, _xs: &Tensor, _is_prefill: bool) -> Result<Tensor> {
+        candle::bail!("FusedMoeNvfp4 is not supported on GCU")
+    }
+
+    pub fn forward_with_routing(
+        &self,
+        _xs: &Tensor,
+        _topk_weights: Tensor,
+        _topk_ids: Tensor,
+        _is_prefill: bool,
+    ) -> Result<Tensor> {
+        candle::bail!("FusedMoeNvfp4 is not supported on GCU")
+    }
+
+    pub fn set_sigmoid_routing(&mut self) {}
+
+    pub fn set_apply_router_weight_on_input(&mut self, _val: bool) {}
 }

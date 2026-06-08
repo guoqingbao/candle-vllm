@@ -560,6 +560,8 @@ pub struct Config {
     #[serde(default)]
     pub kvcache_dtype: KvCacheDtype,
     pub extra_config_json: Option<String>,
+    #[serde(default)]
+    pub fp8_kvcache: Option<bool>,
 }
 
 impl Config {

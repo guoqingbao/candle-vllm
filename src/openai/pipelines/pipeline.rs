@@ -1775,7 +1775,6 @@ impl DefaultPipeline {
                 config.max_seq_len,
                 block_size,
                 config.hidden_size,
-                config.is_mla(),
                 #[cfg(feature = "flashinfer")]
                 &flashinfer_kv_params,
             ),
@@ -1790,7 +1789,7 @@ impl DefaultPipeline {
         input_metadata: &InputMetadata,
         images: Option<&crate::openai::multimodal::ImageData>,
     ) -> Result<Tensor> {
-        let _fp8_linear_prefill_guard = set_fp8_linear_is_prefill(input_metadata.is_prefill);
+        let _fp8_linear_prefill_guard = set_linear_is_prefill(input_metadata.is_prefill);
         #[cfg(all(any(feature = "gcu", feature = "cuda"), feature = "graph"))]
         if !input_metadata.is_prefill {
             let input_batch = input_tokens.dim(0)?;

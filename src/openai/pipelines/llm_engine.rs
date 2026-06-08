@@ -637,6 +637,7 @@ impl LLMEngine {
         x
     }
 
+    #[allow(unused)]
     pub fn new(
         mut pipelines: HashMap<usize, (Box<DefaultPipeline>, CacheEngine)>,
         scheduler_config: SchedulerConfig,

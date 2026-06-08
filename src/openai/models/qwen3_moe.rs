@@ -8,7 +8,7 @@ use crate::openai::distributed::{
 };
 use crate::openai::models::layers::deepstack::ApplyDeepStack;
 use crate::openai::models::layers::moe::FusedMoe;
-#[cfg(not(feature = "gcu"))]
+#[allow(unused)]
 use crate::openai::models::layers::moe::{FusedMoeFp8, FusedMoeISQ, FusedMoeMxfp4, FusedMoeNvfp4};
 use crate::openai::models::linear::LinearX as Linear;
 use crate::openai::models::mask::get_attention_causal_mask;

@@ -651,10 +651,6 @@ impl BlockEngine {
         self.prefix_cache.is_some()
     }
 
-    pub fn requires_mamba_prefix_snapshots(&self) -> bool {
-        self.require_mamba_prefix_snapshots
-    }
-
     pub fn prefix_cache_blocks(&self) -> usize {
         self.prefix_cache
             .as_ref()

@@ -727,6 +727,7 @@ impl Gemma4 {
             moe_config,
             isq_quant: quant,
             kvcache_dtype: KvCacheDtype::Auto,
+            fp8_kvcache: None,
             extra_config_json: Some(raw),
         };
         Ok(config)
@@ -912,10 +913,16 @@ impl Gemma4 {
         .to_dtype(DType::F32)?
         .reshape((cfg.max_position_embeddings.unwrap(), 1))?;
         let freqs = t.matmul(&inv_freq)?;
+        let cos = freqs.cos()?.to_dtype(DType::F32)?;
+        let sin = freqs.sin()?.to_dtype(DType::F32)?;
+        #[cfg(feature = "gcu")]
+        let cos_sin = Tensor::cat(&[&cos, &sin], candle::D::Minus1)?;
         let rotary_emb = Arc::new(ScalingRotaryEmbedding {
             0: DefaultRotaryEmbedding {
-                cos: freqs.cos()?.to_dtype(DType::F32)?,
-                sin: freqs.sin()?.to_dtype(DType::F32)?,
+                cos,
+                sin,
+                #[cfg(feature = "gcu")]
+                cos_sin,
                 is_gpt_neox: true,
                 rotary_dim: None,
             },

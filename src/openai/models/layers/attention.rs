@@ -684,27 +684,22 @@ impl Attention {
                         .contiguous()?;
                     let q_flat = q.flatten(0, 2)?;
                     let k_flat = k.flatten(0, 2)?;
-                let q_flat = q_norm.forward(&q_flat)?;
-                let k_flat = k_norm.forward(&k_flat)?;
-                let q = q_flat
-                    .reshape((1, self.num_heads, seq_len, self.head_dim))?
-                    .transpose(1, 2)?
-                    .contiguous()?;
-                let k = k_flat
-                    .reshape((1, self.num_kv_heads, seq_len, self.head_dim))?
-                    .transpose(1, 2)?
-                    .contiguous()?;
-                let q = q.squeeze(0)?;
-                let k = k.squeeze(0)?;
-                (q, k)
-            }
-            #[cfg(not(feature = "gcu"))]
-            {
-                if self.no_per_head_norm {
-                    let q = q_norm.forward(&q)?;
-                    let k = k_norm.forward(&k)?;
+                    let q_flat = q_norm.forward(&q_flat)?;
+                    let k_flat = k_norm.forward(&k_flat)?;
+                    let q = q_flat
+                        .reshape((1, self.num_heads, seq_len, self.head_dim))?
+                        .transpose(1, 2)?
+                        .contiguous()?;
+                    let k = k_flat
+                        .reshape((1, self.num_kv_heads, seq_len, self.head_dim))?
+                        .transpose(1, 2)?
+                        .contiguous()?;
+                    let q = q.squeeze(0)?;
+                    let k = k.squeeze(0)?;
                     (q, k)
-                } else {
+                }
+                #[cfg(not(feature = "gcu"))]
+                {
                     let q_flat = q.flatten(0, 1)?;
                     let k_flat = k.flatten(0, 1)?;
 

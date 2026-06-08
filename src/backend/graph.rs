@@ -532,6 +532,7 @@ mod graph_gcu {
 
                 Ok(InputMetadata {
                     is_prefill: false,
+                    is_mla: false,
                     sequence_ids: None,
                     mamba_slot_mapping: Some(mamba_slot_mapping.narrow(0, 0, bs)?),
                     slot_mapping: slot_mapping.narrow(0, 0, bs)?,
@@ -542,7 +543,6 @@ mod graph_gcu {
                     max_seqlen_q: 0,
                     max_seqlen_k: 0,
                     max_context_len: self.max_model_len,
-                    disable_flash_attn: None,
                     seqlens: None,
                     flashinfer_metadata,
                 })

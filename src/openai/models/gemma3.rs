@@ -193,6 +193,7 @@ impl Gemma3 {
             moe_config: None,
             isq_quant: quant,
             kvcache_dtype: KvCacheDtype::Auto,
+            fp8_kvcache: None,
             extra_config_json: Some(raw),
         };
         Ok(config)
