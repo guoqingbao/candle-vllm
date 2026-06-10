@@ -42,6 +42,30 @@ pub struct TensorParallelColumnLinear {
     bias: Option<Tensor>,
 }
 
+pub fn tensor_parallel_chunk(
+    x: &Tensor,
+    dim: usize,
+    rank: usize,
+    world_size: usize,
+    name: &str,
+) -> Result<Tensor> {
+    if world_size <= 1 {
+        return Ok(x.clone());
+    }
+    let dim_size = x.dim(dim)?;
+    if dim_size % world_size != 0 {
+        candle_core::bail!(
+            "tensor-parallel chunk for {} dim {} size {} is not divisible by world_size {}",
+            name,
+            dim,
+            dim_size,
+            world_size
+        );
+    }
+    let chunk_size = dim_size / world_size;
+    x.narrow(dim, rank * chunk_size, chunk_size)?.contiguous()
+}
+
 impl TensorParallelColumnLinear {
     pub fn new(linear: LinearX) -> Self {
         Self { linear, bias: None }
@@ -337,11 +361,13 @@ impl MergedParallelColumnLinear {
     }
 }
 
+#[allow(dead_code)]
 pub struct TensorParallelRowLinear {
     linear: LinearX,
     #[cfg(feature = "eccl")]
     all_reduce: AllReduce,
     bias: Option<Tensor>,
+    dtype: DType,
 }
 
 #[allow(dead_code)]
@@ -357,9 +383,6 @@ impl AllReduce {
         Self { comm: comm.clone() }
     }
     pub fn apply(&self, xs: &Tensor) -> Result<Tensor> {
-        if self.comm.world_size() <= 1 {
-            return Ok(xs.clone());
-        }
         xs.apply_op1_no_bwd(self)
     }
 }
@@ -441,6 +464,7 @@ impl TensorParallelRowLinear {
             #[cfg(feature = "eccl")]
             all_reduce,
             bias: None,
+            dtype,
         }
     }
 
@@ -453,6 +477,7 @@ impl TensorParallelRowLinear {
             #[cfg(feature = "eccl")]
             all_reduce,
             bias,
+            dtype,
         }
     }
 
@@ -462,11 +487,9 @@ impl TensorParallelRowLinear {
         let xs = xs.apply_op1_no_bwd(&self.all_reduce)?;
 
         if let Some(bias) = &self.bias {
-            let xs = xs.broadcast_add(bias)?;
-            Ok(xs)
-        } else {
-            Ok(xs)
+            xs = xs.broadcast_add(bias)?;
         }
+        Ok(xs)
     }
 }
 
@@ -862,7 +885,7 @@ impl TensorParallelRowLinear {
             dtype,
             None,
         )?;
-        Ok(Self::new_with_bias(linear, bs, comm))
+        Ok(Self::new_with_bias(linear, bs, comm, dtype))
     }
 }
 
@@ -1042,5 +1065,288 @@ impl ReplicatedLinear {
         panic!("tensor offload not available on this device!");
         #[cfg(feature = "gcu")]
         self.linear.reload()
+    }
+}
+
+#[allow(dead_code)]
+pub struct AllGather {
+    comm: Rc<Comm>,
+    world_size: usize,
+}
+
+unsafe impl Sync for AllGather {}
+unsafe impl Send for AllGather {}
+
+impl AllGather {
+    pub fn new(comm: Rc<Comm>) -> Self {
+        let world_size = comm.world_size();
+        Self { comm, world_size }
+    }
+
+    pub fn apply(&self, xs: &Tensor) -> Result<Tensor> {
+        xs.apply_op1_no_bwd(self)
+    }
+}
+
+impl CustomOp1 for AllGather {
+    fn name(&self) -> &'static str {
+        "allgather"
+    }
+
+    fn cpu_fwd(&self, _s: &CpuStorage, _l: &Layout) -> Result<(CpuStorage, Shape)> {
+        candle_core::bail!("AllGather is never used on cpu")
+    }
+
+    #[cfg(all(feature = "cuda", feature = "nccl"))]
+    fn cuda_fwd(
+        &self,
+        s: &candle_core::CudaStorage,
+        l: &Layout,
+    ) -> Result<(candle_core::CudaStorage, Shape)> {
+        use candle_core::backend::BackendStorage;
+        use candle_core::cuda_backend::cudarc::driver::DeviceSlice;
+        use candle_core::cuda_backend::WrapErr;
+        use candle_core::DType;
+        use half::{bf16, f16};
+
+        let elem_count = l.shape().elem_count();
+        let dev = s.device().clone();
+        let start_offset = l.start_offset();
+        let total_elems = elem_count * self.world_size;
+
+        let dst = match s.dtype() {
+            DType::BF16 => {
+                let full_slice = s.as_cuda_slice::<bf16>()?;
+                let full_len = full_slice.len();
+                let end_offset = start_offset.saturating_add(elem_count);
+                if end_offset > full_len {
+                    candle_core::bail!(
+                        "all_gather BF16 slice out of bounds: start={}, elem_count={}, len={}",
+                        start_offset,
+                        elem_count,
+                        full_len
+                    );
+                }
+                let src_slice = full_slice.slice(start_offset..end_offset);
+                let mut dst = unsafe { dev.alloc::<bf16>(total_elems) }.w()?;
+                self.comm
+                    .all_gather(&src_slice, &mut dst)
+                    .map_err(candle_core::Error::debug)?;
+                candle_core::CudaStorage::wrap_cuda_slice(dst, dev)
+            }
+            DType::F16 => {
+                let full_slice = s.as_cuda_slice::<f16>()?;
+                let full_len = full_slice.len();
+                let end_offset = start_offset.saturating_add(elem_count);
+                if end_offset > full_len {
+                    candle_core::bail!(
+                        "all_gather F16 slice out of bounds: start={}, elem_count={}, len={}",
+                        start_offset,
+                        elem_count,
+                        full_len
+                    );
+                }
+                let src_slice = full_slice.slice(start_offset..end_offset);
+                let mut dst = unsafe { dev.alloc::<f16>(total_elems) }.w()?;
+                self.comm
+                    .all_gather(&src_slice, &mut dst)
+                    .map_err(candle_core::Error::debug)?;
+                candle_core::CudaStorage::wrap_cuda_slice(dst, dev)
+            }
+            DType::F32 => {
+                let full_slice = s.as_cuda_slice::<f32>()?;
+                let full_len = full_slice.len();
+                let end_offset = start_offset.saturating_add(elem_count);
+                if end_offset > full_len {
+                    candle_core::bail!(
+                        "all_gather F32 slice out of bounds: start={}, elem_count={}, len={}",
+                        start_offset,
+                        elem_count,
+                        full_len
+                    );
+                }
+                let src_slice = full_slice.slice(start_offset..end_offset);
+                let mut dst = unsafe { dev.alloc::<f32>(total_elems) }.w()?;
+                self.comm
+                    .all_gather(&src_slice, &mut dst)
+                    .map_err(candle_core::Error::debug)?;
+                candle_core::CudaStorage::wrap_cuda_slice(dst, dev)
+            }
+            dtype => candle_core::bail!("unsupported dtype for all_gather: {dtype:?}"),
+        };
+
+        let dims = l.shape().dims();
+        let mut out_dims = dims.to_vec();
+        out_dims[0] *= self.world_size;
+        Ok((dst, Shape::from_dims(&out_dims)))
+    }
+}
+
+const VOCAB_PADDING_SIZE: usize = 64;
+
+fn pad_vocab_size(vocab_size: usize, world_size: usize) -> usize {
+    let padded = ((vocab_size + VOCAB_PADDING_SIZE - 1) / VOCAB_PADDING_SIZE) * VOCAB_PADDING_SIZE;
+    let per_rank = ((padded + world_size - 1) / world_size) * world_size;
+    ((per_rank + VOCAB_PADDING_SIZE - 1) / VOCAB_PADDING_SIZE) * VOCAB_PADDING_SIZE
+}
+
+#[allow(dead_code)]
+pub struct VocabParallelLinear {
+    linear: LinearX,
+    #[cfg(feature = "nccl")]
+    all_gather: Option<AllGather>,
+    org_vocab_size: usize,
+    dtype: DType,
+}
+
+impl VocabParallelLinear {
+    #[allow(unused_variables)]
+    pub fn load_no_bias(
+        in_dim: usize,
+        out_dim: usize,
+        vb: VarBuilder,
+        comm: Rc<Comm>,
+        quant: &Option<String>,
+        quant_config: &Option<QuantConfig>,
+        dtype: DType,
+    ) -> Result<Self> {
+        let world_size = comm.world_size();
+        if world_size <= 1 {
+            let linear = linear(
+                in_dim,
+                out_dim,
+                vb,
+                shard(0, 0, 1),
+                quant,
+                quant_config,
+                dtype,
+                None,
+            )?;
+            return Ok(Self {
+                linear,
+                #[cfg(feature = "nccl")]
+                all_gather: None,
+                org_vocab_size: out_dim,
+                dtype,
+            });
+        }
+
+        let padded_vocab = pad_vocab_size(out_dim, world_size);
+        let linear = linear(
+            in_dim,
+            padded_vocab,
+            vb,
+            shard(0, comm.rank(), world_size),
+            quant,
+            quant_config,
+            dtype,
+            None,
+        )?;
+
+        #[cfg(feature = "nccl")]
+        let all_gather = Some(AllGather::new(comm));
+
+        Ok(Self {
+            linear,
+            #[cfg(feature = "nccl")]
+            all_gather,
+            org_vocab_size: out_dim,
+            dtype,
+        })
+    }
+
+    #[allow(unused_variables)]
+    pub fn from_weight_bias(
+        weight: Tensor,
+        bias: Option<Tensor>,
+        comm: Rc<Comm>,
+        org_vocab_size: usize,
+        dtype: DType,
+    ) -> Result<Self> {
+        let world_size = comm.world_size();
+        if world_size <= 1 {
+            let linear = LinearX::Linear(Linear::new(weight, bias));
+            return Ok(Self {
+                linear,
+                #[cfg(feature = "nccl")]
+                all_gather: None,
+                org_vocab_size,
+                dtype,
+            });
+        }
+
+        let vocab_dim = weight.dim(0)?;
+        let padded_vocab = pad_vocab_size(org_vocab_size, world_size);
+        let local_vocab = padded_vocab / world_size;
+        let rank = comm.rank();
+
+        let weight = if vocab_dim < padded_vocab {
+            let hidden = weight.dim(1)?;
+            let pad_rows = padded_vocab - vocab_dim;
+            let padding = Tensor::zeros((pad_rows, hidden), weight.dtype(), weight.device())?;
+            Tensor::cat(&[&weight, &padding], 0)?
+        } else {
+            weight
+        };
+
+        let local_weight = weight
+            .narrow(0, rank * local_vocab, local_vocab)?
+            .contiguous()?;
+
+        let linear = LinearX::Linear(Linear::new(local_weight, bias));
+
+        #[cfg(feature = "nccl")]
+        let all_gather = Some(AllGather::new(comm));
+
+        Ok(Self {
+            linear,
+            #[cfg(feature = "nccl")]
+            all_gather,
+            org_vocab_size,
+            dtype,
+        })
+    }
+
+    #[allow(unused_variables)]
+    pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        let logits = self.linear.forward(x)?;
+
+        #[cfg(feature = "nccl")]
+        if let Some(all_gather) = &self.all_gather {
+            let gathered = if logits.dtype() != self.dtype {
+                let g = all_gather.apply(&logits.to_dtype(self.dtype)?)?;
+                g.to_dtype(logits.dtype())?
+            } else {
+                all_gather.apply(&logits)?
+            };
+
+            let ws = all_gather.world_size;
+            let local_vocab = logits.dim(logits.dims().len() - 1)?;
+            let batch = logits.dims()[..logits.dims().len() - 1]
+                .iter()
+                .product::<usize>();
+
+            let gathered = gathered.reshape((ws, batch, local_vocab))?;
+            let gathered = gathered.transpose(0, 1)?.contiguous()?;
+            let full_vocab = ws * local_vocab;
+            let logits = gathered.reshape((batch, full_vocab))?;
+
+            let orig_dims = &x.dims()[..x.dims().len() - 1];
+            let logits = if orig_dims.len() > 1 {
+                let mut shape = orig_dims.to_vec();
+                shape.push(full_vocab);
+                logits.reshape(shape)?
+            } else {
+                logits
+            };
+
+            if full_vocab > self.org_vocab_size {
+                let last_dim = logits.dims().len() - 1;
+                return logits.narrow(last_dim, 0, self.org_vocab_size);
+            }
+            return Ok(logits);
+        }
+
+        Ok(logits)
     }
 }

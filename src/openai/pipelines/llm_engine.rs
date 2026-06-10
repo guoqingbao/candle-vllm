@@ -856,16 +856,19 @@ impl LLMEngine {
                         }
                     }
                 }
+                #[cfg(feature = "nccl")]
+                if multi_process && !is_master_rank {
+                    Self::run_daemon_loop(engine);
+                    return;
+                }
+
                 loop {
                     if engine.read().exit_flag.load(Ordering::Relaxed) {
                         break;
                     }
-                    if is_master_rank {
-                        notify.notified().await;
-                        if engine.read().exit_flag.load(Ordering::Relaxed) {
-                            break;
-                        }
-                        let _ = tokio::time::sleep(tokio::time::Duration::from_millis(holding_time as u64)).await;
+                    notify.notified().await;
+                    if engine.read().exit_flag.load(Ordering::Relaxed) {
+                        break;
                     }
                     {
                         let should_continue = if multi_process {
@@ -964,6 +967,12 @@ impl LLMEngine {
                         decode_tps,
                         decode_tps * result.len() as f32,
                     );
+                }
+
+                #[cfg(feature = "nccl")]
+                if multi_process {
+                    let e = engine.read();
+                    e.broadcast_shutdown();
                 }
             });
         });
@@ -1218,6 +1227,7 @@ impl LLMEngine {
 
         let (k_cache, _) = &kv_cache[0];
         let (_, page_size, num_kv_heads, head_dim) = k_cache.dims4()?;
+        let is_mla = self.config.is_mla();
         Ok(Some(FlashInferKvParams {
             kv_dtype: k_cache.dtype(),
             out_dtype: self
@@ -1227,7 +1237,11 @@ impl LLMEngine {
             page_size,
             num_kv_heads,
             head_dim,
-            num_qo_heads: self.config.num_attention_heads / self.num_shards,
+            num_qo_heads: if is_mla {
+                self.config.num_attention_heads
+            } else {
+                self.config.num_attention_heads / self.num_shards
+            },
         }))
     }
 
