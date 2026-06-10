@@ -189,6 +189,7 @@ impl DeepSeek {
             fp8_kvcache: None,
             kvcache_dtype: Default::default(),
             extra_config_json: None,
+            is_f16_mode: false,
         };
         Ok(config)
     }

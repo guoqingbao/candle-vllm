@@ -562,6 +562,8 @@ pub struct Config {
     pub extra_config_json: Option<String>,
     #[serde(default)]
     pub fp8_kvcache: Option<bool>,
+    #[serde(default)]
+    pub is_f16_mode: bool,
 }
 
 impl Config {
@@ -620,7 +622,8 @@ impl Config {
     }
 
     pub fn higher_precision_required(&self) -> bool {
-        self.isq_quant.is_some()
+        self.is_f16_mode
+            || self.isq_quant.is_some()
             || self
                 .quantization_config
                 .as_ref()
@@ -850,6 +853,8 @@ mod tests {
             isq_quant: None,
             kvcache_dtype: KvCacheDtype::Auto,
             extra_config_json: None,
+            fp8_kvcache: None,
+            is_f16_mode: false,
         }
     }
 

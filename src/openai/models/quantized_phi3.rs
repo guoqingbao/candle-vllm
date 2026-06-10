@@ -193,6 +193,7 @@ impl GGUFPhi3 {
             kvcache_dtype: KvCacheDtype::Auto,
             fp8_kvcache: None,
             extra_config_json: None,
+            is_f16_mode: false,
         }
     }
 

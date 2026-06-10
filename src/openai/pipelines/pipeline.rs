@@ -933,6 +933,8 @@ impl DefaultLoader {
                 );
             }
 
+            config.is_f16_mode = dtype == DType::F16;
+
             info!("Model {:?}", config);
 
             info!("Loading {} model.", arch);
