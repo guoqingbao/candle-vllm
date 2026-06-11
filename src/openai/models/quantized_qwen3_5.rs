@@ -402,20 +402,12 @@ impl QuantizedGatedDeltaNet {
                 .as_ref()
                 .expect("cu_seqlens_q must be present in prefill!");
             let global_state = mamba_cache.recurrent_state_mut(self.gdn_layer_idx);
-            if self.num_k_heads != self.num_v_heads {
-                gdn::gated_delta_rule_recurrence_varlen_gqa(
-                    &q,
-                    &k,
-                    &v,
-                    &g,
-                    &beta,
-                    global_state,
-                    seq_slots,
-                    cu_seqlens,
-                    self.scale as f32,
-                )?
-            } else {
-                let (q, k) = (self.repeat_kv_heads(q)?, self.repeat_kv_heads(k)?);
+            {
+                let (q, k) = if self.num_k_heads != self.num_v_heads {
+                    (self.repeat_kv_heads(q)?, self.repeat_kv_heads(k)?)
+                } else {
+                    (q, k)
+                };
                 let q_scaled = (&q * self.scale)?;
                 gdn::gated_delta_rule_recurrence_varlen(
                     &q_scaled,

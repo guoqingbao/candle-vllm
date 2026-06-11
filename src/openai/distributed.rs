@@ -456,7 +456,7 @@ impl CustomOp1 for AllReduce {
 
 impl TensorParallelRowLinear {
     #[allow(unused_variables)]
-    pub fn new(linear: LinearX, comm: Rc<Comm>) -> Self {
+    pub fn new(linear: LinearX, comm: Rc<Comm>, dtype: DType) -> Self {
         #[cfg(feature = "eccl")]
         let all_reduce = AllReduce { comm };
         Self {
@@ -469,7 +469,12 @@ impl TensorParallelRowLinear {
     }
 
     #[allow(unused_variables)]
-    pub fn new_with_bias(linear: LinearX, bias: Option<Tensor>, comm: Rc<Comm>) -> Self {
+    pub fn new_with_bias(
+        linear: LinearX,
+        bias: Option<Tensor>,
+        comm: Rc<Comm>,
+        dtype: DType,
+    ) -> Self {
         #[cfg(feature = "eccl")]
         let all_reduce = AllReduce { comm };
         Self {
@@ -482,9 +487,11 @@ impl TensorParallelRowLinear {
     }
 
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let xs = self.linear.forward(x)?;
+        let mut xs = self.linear.forward(x)?;
         #[cfg(feature = "eccl")]
-        let xs = xs.apply_op1_no_bwd(&self.all_reduce)?;
+        {
+            xs = xs.apply_op1_no_bwd(&self.all_reduce)?;
+        }
 
         if let Some(bias) = &self.bias {
             xs = xs.broadcast_add(bias)?;
@@ -1097,15 +1104,15 @@ impl CustomOp1 for AllGather {
         candle_core::bail!("AllGather is never used on cpu")
     }
 
-    #[cfg(all(feature = "cuda", feature = "nccl"))]
-    fn cuda_fwd(
+    #[cfg(all(feature = "gcu", feature = "eccl"))]
+    fn gcu_fwd(
         &self,
-        s: &candle_core::CudaStorage,
+        s: &candle_core::GcuStorage,
         l: &Layout,
-    ) -> Result<(candle_core::CudaStorage, Shape)> {
+    ) -> Result<(candle_core::GcuStorage, Shape)> {
+        use candle::gcu_backend::WrapErr;
+        use candle_core as candle;
         use candle_core::backend::BackendStorage;
-        use candle_core::cuda_backend::cudarc::driver::DeviceSlice;
-        use candle_core::cuda_backend::WrapErr;
         use candle_core::DType;
         use half::{bf16, f16};
 
@@ -1116,8 +1123,8 @@ impl CustomOp1 for AllGather {
 
         let dst = match s.dtype() {
             DType::BF16 => {
-                let full_slice = s.as_cuda_slice::<bf16>()?;
-                let full_len = full_slice.len();
+                let full_slice = s.as_gcu_slice::<bf16>()?;
+                let full_len = full_slice.len;
                 let end_offset = start_offset.saturating_add(elem_count);
                 if end_offset > full_len {
                     candle_core::bail!(
@@ -1128,15 +1135,15 @@ impl CustomOp1 for AllGather {
                     );
                 }
                 let src_slice = full_slice.slice(start_offset..end_offset);
-                let mut dst = unsafe { dev.alloc::<bf16>(total_elems) }.w()?;
+                let mut dst = dev.alloc::<bf16>(total_elems).w()?;
                 self.comm
                     .all_gather(&src_slice, &mut dst)
                     .map_err(candle_core::Error::debug)?;
-                candle_core::CudaStorage::wrap_cuda_slice(dst, dev)
+                candle_core::GcuStorage::wrap_gcu_slice(dst, dev)
             }
             DType::F16 => {
-                let full_slice = s.as_cuda_slice::<f16>()?;
-                let full_len = full_slice.len();
+                let full_slice = s.as_gcu_slice::<f16>()?;
+                let full_len = full_slice.len;
                 let end_offset = start_offset.saturating_add(elem_count);
                 if end_offset > full_len {
                     candle_core::bail!(
@@ -1147,15 +1154,15 @@ impl CustomOp1 for AllGather {
                     );
                 }
                 let src_slice = full_slice.slice(start_offset..end_offset);
-                let mut dst = unsafe { dev.alloc::<f16>(total_elems) }.w()?;
+                let mut dst = dev.alloc::<f16>(total_elems).w()?;
                 self.comm
                     .all_gather(&src_slice, &mut dst)
                     .map_err(candle_core::Error::debug)?;
-                candle_core::CudaStorage::wrap_cuda_slice(dst, dev)
+                candle_core::GcuStorage::wrap_gcu_slice(dst, dev)
             }
             DType::F32 => {
-                let full_slice = s.as_cuda_slice::<f32>()?;
-                let full_len = full_slice.len();
+                let full_slice = s.as_gcu_slice::<f32>()?;
+                let full_len = full_slice.len;
                 let end_offset = start_offset.saturating_add(elem_count);
                 if end_offset > full_len {
                     candle_core::bail!(
@@ -1166,11 +1173,11 @@ impl CustomOp1 for AllGather {
                     );
                 }
                 let src_slice = full_slice.slice(start_offset..end_offset);
-                let mut dst = unsafe { dev.alloc::<f32>(total_elems) }.w()?;
+                let mut dst = dev.alloc::<f32>(total_elems).w()?;
                 self.comm
                     .all_gather(&src_slice, &mut dst)
                     .map_err(candle_core::Error::debug)?;
-                candle_core::CudaStorage::wrap_cuda_slice(dst, dev)
+                candle_core::GcuStorage::wrap_gcu_slice(dst, dev)
             }
             dtype => candle_core::bail!("unsupported dtype for all_gather: {dtype:?}"),
         };
@@ -1193,7 +1200,7 @@ fn pad_vocab_size(vocab_size: usize, world_size: usize) -> usize {
 #[allow(dead_code)]
 pub struct VocabParallelLinear {
     linear: LinearX,
-    #[cfg(feature = "nccl")]
+    #[cfg(feature = "eccl")]
     all_gather: Option<AllGather>,
     org_vocab_size: usize,
     dtype: DType,
@@ -1224,7 +1231,7 @@ impl VocabParallelLinear {
             )?;
             return Ok(Self {
                 linear,
-                #[cfg(feature = "nccl")]
+                #[cfg(feature = "eccl")]
                 all_gather: None,
                 org_vocab_size: out_dim,
                 dtype,
@@ -1243,12 +1250,12 @@ impl VocabParallelLinear {
             None,
         )?;
 
-        #[cfg(feature = "nccl")]
+        #[cfg(feature = "eccl")]
         let all_gather = Some(AllGather::new(comm));
 
         Ok(Self {
             linear,
-            #[cfg(feature = "nccl")]
+            #[cfg(feature = "eccl")]
             all_gather,
             org_vocab_size: out_dim,
             dtype,
@@ -1268,7 +1275,7 @@ impl VocabParallelLinear {
             let linear = LinearX::Linear(Linear::new(weight, bias));
             return Ok(Self {
                 linear,
-                #[cfg(feature = "nccl")]
+                #[cfg(feature = "eccl")]
                 all_gather: None,
                 org_vocab_size,
                 dtype,
@@ -1295,12 +1302,12 @@ impl VocabParallelLinear {
 
         let linear = LinearX::Linear(Linear::new(local_weight, bias));
 
-        #[cfg(feature = "nccl")]
+        #[cfg(feature = "eccl")]
         let all_gather = Some(AllGather::new(comm));
 
         Ok(Self {
             linear,
-            #[cfg(feature = "nccl")]
+            #[cfg(feature = "eccl")]
             all_gather,
             org_vocab_size,
             dtype,
@@ -1311,7 +1318,7 @@ impl VocabParallelLinear {
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let logits = self.linear.forward(x)?;
 
-        #[cfg(feature = "nccl")]
+        #[cfg(feature = "eccl")]
         if let Some(all_gather) = &self.all_gather {
             let gathered = if logits.dtype() != self.dtype {
                 let g = all_gather.apply(&logits.to_dtype(self.dtype)?)?;

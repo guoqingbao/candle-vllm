@@ -140,6 +140,12 @@ impl LLMEngine {
         false
     }
 
+    #[cfg(feature = "eccl")]
+    pub fn sync_multiprocess_waiting_tasks_before_cycle(engine: &Arc<RwLock<Self>>) -> bool {
+        ThreadedRunner::sync_waiting_tasks(engine);
+        false
+    }
+
     pub fn generate_once_threaded(
         engine: Arc<RwLock<Self>>,
         rank: usize,

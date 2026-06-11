@@ -14,7 +14,7 @@ const HYBRID_MAMBA_MIN_ACTIVE_SLOTS: usize = 8;
 #[cfg(not(feature = "cuda"))]
 const HYBRID_MAMBA_MIN_ACTIVE_SLOTS: usize = 4;
 
-#[cfg(any(feature = "eccl", feature = "nccl"))]
+#[cfg(feature = "eccl")]
 use crate::openai::communicator::DaemonManager;
 use crate::openai::pipelines::TokenOrFinishReason;
 use crate::openai::streaming::ChatResponse;
@@ -318,11 +318,6 @@ impl LLMEngine {
             &Tensor::from_vec(row_indices.to_vec(), (batch_size,), logits.device())?,
             0,
         )
-    }
-
-    #[cfg(feature = "eccl")]
-    fn primary_sequence_id(group: &Arc<SequenceGroup>) -> usize {
-        Self::primary_sequence(group).deref().get_id()
     }
 
     fn capture_mamba_prefix_states_for_prefill_progress(
@@ -856,7 +851,7 @@ impl LLMEngine {
                         }
                     }
                 }
-                #[cfg(feature = "nccl")]
+                #[cfg(feature = "eccl")]
                 if multi_process && !is_master_rank {
                     Self::run_daemon_loop(engine);
                     return;
@@ -969,7 +964,7 @@ impl LLMEngine {
                     );
                 }
 
-                #[cfg(feature = "nccl")]
+                #[cfg(feature = "eccl")]
                 if multi_process {
                     let e = engine.read();
                     e.broadcast_shutdown();

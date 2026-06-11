@@ -310,7 +310,7 @@ async fn main() -> Result<()> {
 
     candle_vllm::openai::utils::ensure_port_free(&host, port);
 
-    #[cfg(any(feature = "eccl", feature = "nccl"))]
+    #[cfg(feature = "eccl")]
     let (pipelines, global_rank, daemon_manager) = if multi_process {
         use candle_vllm::openai::communicator::init_subprocess;
         let (id, local_rank, global_rank, global_world_size, daemon_manager) =
