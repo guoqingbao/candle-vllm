@@ -332,6 +332,25 @@ pub fn query_device_memory(device: &Device) -> Result<DeviceMemoryReport> {
                 used_bytes,
             })
         }
+        #[cfg(feature = "gcu")]
+        Device::Gcu(_gcu) => {
+            use candle_core::gcu_backend::ubridge::gcu_device::driv;
+            use candle_core::gcu_backend::ubridge::prelude::tops::error::ToResult;
+
+            let mut free_bytes: usize = 0;
+            let mut total_bytes: usize = 0;
+            unsafe {
+                driv::topsMemGetInfo(&mut free_bytes, &mut total_bytes)
+                    .to_result()
+                    .map_err(|e| candle::Error::msg(format!("topsMemGetInfo failed: {e:?}")))?;
+            }
+            let used_bytes = total_bytes.saturating_sub(free_bytes);
+            Ok(DeviceMemoryReport {
+                total_bytes,
+                free_bytes,
+                used_bytes,
+            })
+        }
         Device::Cpu => Err(candle::Error::msg(
             "gpu_memory_fraction requires a CUDA or Metal device",
         )),

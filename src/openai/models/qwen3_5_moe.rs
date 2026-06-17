@@ -499,12 +499,12 @@ impl Qwen3_5MoE {
                 num_v_heads,
                 hybrid.key_head_dim,
                 hybrid.value_head_dim,
-                DType::F32,
+                dtype, // GCU kernel use f16/bf16 conv states
                 DType::F32,
                 device,
             )?
         } else {
-            MambaCache::new(0, 1, 1, 2, 1, 1, 1, DType::F32, DType::F32, device)?
+            MambaCache::new(0, 1, 1, 2, 1, 1, 1, dtype, DType::F32, device)?
         };
 
         Ok(Self {
